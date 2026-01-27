@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { Color } from "../lib/grid";
 import { idx } from "../lib/grid";
+import { assetPath } from "../lib/assetPath";
 import { symbolForColorId } from "../lib/symbols";
 
 type Props = {
@@ -32,7 +33,7 @@ type Props = {
   onTraceScaleChange: (scale: number) => void;
   panMode: boolean;
   showGridlines: boolean;
-  tool: "paint" | "eraser" | "eyedropper" | "lasso";
+  tool: "paint" | "eraser" | "fill" | "eyedropper" | "lasso";
   brushSize: number;
   lassoPoints: { x: number; y: number }[];
   lassoClosed: boolean;
@@ -97,6 +98,8 @@ export default function GridCanvas(props: Props) {
   const canvasW = width * cellSize;
   const canvasH = height * cellSize;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const gridRef = useRef(grid);
+  gridRef.current = grid;
   const traceSamplerRef = useRef<HTMLCanvasElement | null>(null);
   const [isPainting, setIsPainting] = useState(false);
   const [isLassoing, setIsLassoing] = useState(false);
@@ -118,96 +121,6 @@ export default function GridCanvas(props: Props) {
   const isPanningRef = useRef(false);
   const pinchActiveRef = useRef(false);
   const fillTokenRef = useRef(0);
-  const fillWorkerRef = useRef<Worker | null>(null);
-
-  function createFillWorker() {
-    const workerCode = `
-      self.onmessage = (event) => {
-        const data = event.data || {};
-        const gridBuffer = data.gridBuffer;
-        const width = data.width;
-        const height = data.height;
-        const startIdx = data.startIdx;
-        const colorId = data.colorId;
-        if (!gridBuffer || !width || !height) {
-          self.postMessage({ gridBuffer });
-          return;
-        }
-        const grid = new Uint16Array(gridBuffer);
-        if (grid[startIdx] !== 0) {
-          self.postMessage({ gridBuffer: grid.buffer, filledStart: false }, [grid.buffer]);
-          return;
-        }
-        const max = width * height;
-        const stackX = new Int32Array(max);
-        const stackY = new Int32Array(max);
-        let sp = 0;
-
-        const pushSeed = (x, y) => {
-          const i = y * width + x;
-          if (grid[i] !== 0) return;
-          stackX[sp] = x;
-          stackY[sp] = y;
-          sp++;
-        };
-
-        for (let x = 0; x < width; x++) {
-          pushSeed(x, 0);
-          pushSeed(x, height - 1);
-        }
-        for (let y = 1; y < height - 1; y++) {
-          pushSeed(0, y);
-          pushSeed(width - 1, y);
-        }
-
-        while (sp > 0) {
-          sp--;
-          const x0 = stackX[sp];
-          const y0 = stackY[sp];
-          const base = y0 * width;
-          if (grid[base + x0] !== 0) continue;
-
-          let xL = x0;
-          while (xL >= 0 && grid[base + xL] === 0) {
-            grid[base + xL] = colorId;
-            xL--;
-          }
-          xL++;
-          let xR = x0 + 1;
-          while (xR < width && grid[base + xR] === 0) {
-            grid[base + xR] = colorId;
-            xR++;
-          }
-          xR--;
-
-          const checkRow = (ny) => {
-            if (ny < 0 || ny >= height) return;
-            let i = ny * width + xL;
-            const end = ny * width + xR;
-            while (i <= end) {
-              if (grid[i] === 0) {
-                stackX[sp] = i - ny * width;
-                stackY[sp] = ny;
-                sp++;
-                while (i <= end && grid[i] === 0) i++;
-              }
-              i++;
-            }
-          };
-
-          checkRow(y0 - 1);
-          checkRow(y0 + 1);
-        }
-
-        const filledStart = grid[startIdx] === colorId;
-        self.postMessage({ gridBuffer: grid.buffer, filledStart }, [grid.buffer]);
-      };
-    `;
-    const blob = new Blob([workerCode], { type: "application/javascript" });
-    const url = URL.createObjectURL(blob);
-    const worker = new Worker(url);
-    return { worker, url };
-  }
   const panDragStartRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
 
@@ -573,165 +486,204 @@ export default function GridCanvas(props: Props) {
     }
   }
 
-  // Fill tool temporarily disabled (keep logic for future revisit)
-  async function fillAsync(startX: number, startY: number, colorId: number) {
-    const gridSnapshot = grid;
-    const startIdx = idx(startX, startY, width);
-    if (gridSnapshot[startIdx] !== 0) return;
-    let anyPainted = false;
-    for (let i = 0; i < gridSnapshot.length; i++) {
-      if (gridSnapshot[i] !== 0) {
-        anyPainted = true;
-        break;
-      }
-    }
-    if (!anyPainted) {
-      const next = new Uint16Array(gridSnapshot.length);
-      next.fill(colorId);
-      if (onFillGrid) {
-        onFillGrid(next);
-      } else if (onFillCells) {
-        const all = Array.from({ length: gridSnapshot.length }, (_, i) => i);
-        onFillCells(all, colorId);
-      } else {
-        for (let i = 0; i < gridSnapshot.length; i++) {
-          const x = i % width;
-          const y = Math.floor(i / width);
-          onPaintCell(x, y, colorId);
-        }
-      }
-      return;
-    }
-    const token = ++fillTokenRef.current;
-    if (fillWorkerRef.current) {
-      fillWorkerRef.current.terminate();
-      fillWorkerRef.current = null;
-    }
-    if (typeof Worker !== "undefined") {
-      const { worker, url } = createFillWorker();
-      fillWorkerRef.current = worker;
-      const gridCopy = new Uint16Array(gridSnapshot);
-      const { result, filledStart } = await new Promise<{ result: Uint16Array; filledStart: boolean }>((resolve) => {
-        const handleMessage = (event: MessageEvent) => {
-          worker.removeEventListener("message", handleMessage);
-          const data = event.data as { gridBuffer: ArrayBuffer; filledStart: boolean };
-          resolve({ result: new Uint16Array(data.gridBuffer), filledStart: Boolean(data.filledStart) });
-        };
-        worker.addEventListener("message", handleMessage);
-        worker.postMessage(
-          {
-            gridBuffer: gridCopy.buffer,
-            width,
-            height,
-            startIdx,
-            colorId,
-          },
-          [gridCopy.buffer]
-        );
-        setTimeout(() => {
-          worker.removeEventListener("message", handleMessage);
-          resolve({ result: new Uint16Array(gridSnapshot), filledStart: false });
-        }, 5000);
-      });
-      worker.terminate();
-      fillWorkerRef.current = null;
-      URL.revokeObjectURL(url);
-      if (fillTokenRef.current !== token) return;
-      if (!filledStart) return;
-      if (onFillGrid) {
-        onFillGrid(result);
-      } else if (onFillCells) {
-        const cells: number[] = [];
-        for (let i = 0; i < result.length; i++) {
-          if (gridSnapshot[i] === 0 && result[i] === colorId) {
-            cells.push(i);
-          }
-        }
-        onFillCells(cells, colorId);
-      } else {
-        for (let i = 0; i < result.length; i++) {
-          if (gridSnapshot[i] === 0 && result[i] === colorId) {
-            const x = i % width;
-            const y = Math.floor(i / width);
-            onPaintCell(x, y, colorId);
-          }
-        }
-      }
-      return;
-    }
-    const visited = new Uint8Array(width * height);
-    const queue = new Uint32Array(width * height);
-    let head = 0;
-    let tail = 0;
+  type FillResult = { next: Uint16Array; filled: boolean; indices?: number[] };
+
+  function scanlineFillSync(
+    gridSnapshot: Uint16Array,
+    startX: number,
+    startY: number,
+    targetColor: number,
+    newColorId: number,
+    collectIndices: boolean
+  ): FillResult {
+    const w = width;
+    const h = height;
     const next = new Uint16Array(gridSnapshot);
-    queue[tail++] = startIdx;
-    visited[startIdx] = 1;
+    const max = w * h;
+    const stackX = new Int32Array(max);
+    const stackY = new Int32Array(max);
+    let sp = 0;
+    stackX[sp] = startX;
+    stackY[sp] = startY;
+    sp++;
+    let filledAny = false;
+    const indices: number[] | undefined = collectIndices ? [] : undefined;
 
-    const chunkSize = 8000;
-    while (head < tail) {
-      let count = 0;
-      while (head < tail && count < chunkSize) {
-        const i = queue[head++];
-        if (gridSnapshot[i] !== 0) {
-          count++;
-          continue;
+    const scanRow = (ny: number, xL: number, xR: number) => {
+      if (ny < 0 || ny >= h) return;
+      const row = ny * w;
+      let i = row + xL;
+      const end = row + xR;
+      while (i <= end) {
+        if (next[i] === targetColor) {
+          stackX[sp] = i - row;
+          stackY[sp] = ny;
+          sp++;
+          i++;
+          while (i <= end && next[i] === targetColor) i++;
+        } else {
+          i++;
         }
-        next[i] = colorId;
-        const x = i % width;
-        const y = Math.floor(i / width);
-        if (x > 0) {
-          const ni = i - 1;
-          if (!visited[ni] && gridSnapshot[ni] === 0) {
-            visited[ni] = 1;
-            queue[tail++] = ni;
-          }
-        }
-        if (x < width - 1) {
-          const ni = i + 1;
-          if (!visited[ni] && gridSnapshot[ni] === 0) {
-            visited[ni] = 1;
-            queue[tail++] = ni;
-          }
-        }
-        if (y > 0) {
-          const ni = i - width;
-          if (!visited[ni] && gridSnapshot[ni] === 0) {
-            visited[ni] = 1;
-            queue[tail++] = ni;
-          }
-        }
-        if (y < height - 1) {
-          const ni = i + width;
-          if (!visited[ni] && gridSnapshot[ni] === 0) {
-            visited[ni] = 1;
-            queue[tail++] = ni;
-          }
-        }
-        count++;
       }
-      if (fillTokenRef.current !== token) return;
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    while (sp > 0) {
+      sp--;
+      const x0 = stackX[sp];
+      const y0 = stackY[sp];
+      if (x0 < 0 || x0 >= w || y0 < 0 || y0 >= h) continue;
+      const row = y0 * w;
+      if (next[row + x0] !== targetColor) continue;
+
+      let xL = x0;
+      while (xL >= 0 && next[row + xL] === targetColor) xL--;
+      xL++;
+      let xR = x0;
+      while (xR < w && next[row + xR] === targetColor) xR++;
+      xR--;
+
+      for (let x = xL; x <= xR; x++) {
+        const i = row + x;
+        next[i] = newColorId;
+        if (indices) indices.push(i);
+      }
+      filledAny = true;
+      scanRow(y0 - 1, xL, xR);
+      scanRow(y0 + 1, xL, xR);
     }
 
+    return { next, filled: filledAny, indices };
+  }
+
+  async function scanlineFillChunked(
+    gridSnapshot: Uint16Array,
+    startX: number,
+    startY: number,
+    targetColor: number,
+    newColorId: number,
+    collectIndices: boolean,
+    token: number,
+    chunkSeedsPerFrame: number
+  ): Promise<FillResult | null> {
+    const w = width;
+    const h = height;
+    const next = new Uint16Array(gridSnapshot);
+    const max = w * h;
+    const stackX = new Int32Array(max);
+    const stackY = new Int32Array(max);
+    let sp = 0;
+    stackX[sp] = startX;
+    stackY[sp] = startY;
+    sp++;
+    let filledAny = false;
+    const indices: number[] | undefined = collectIndices ? [] : undefined;
+
+    const scanRow = (ny: number, xL: number, xR: number) => {
+      if (ny < 0 || ny >= h) return;
+      const row = ny * w;
+      let i = row + xL;
+      const end = row + xR;
+      while (i <= end) {
+        if (next[i] === targetColor) {
+          stackX[sp] = i - row;
+          stackY[sp] = ny;
+          sp++;
+          i++;
+          while (i <= end && next[i] === targetColor) i++;
+        } else {
+          i++;
+        }
+      }
+    };
+
+    const seedsPerFrame = Math.max(1, Math.floor(chunkSeedsPerFrame));
+
+    return new Promise((resolve) => {
+      const step = () => {
+        if (fillTokenRef.current !== token) {
+          resolve(null);
+          return;
+        }
+        if (gridRef.current !== gridSnapshot) {
+          resolve(null);
+          return;
+        }
+        let processed = 0;
+        while (sp > 0 && processed < seedsPerFrame) {
+          sp--;
+          const x0 = stackX[sp];
+          const y0 = stackY[sp];
+          if (x0 < 0 || x0 >= w || y0 < 0 || y0 >= h) {
+            processed++;
+            continue;
+          }
+          const row = y0 * w;
+          if (next[row + x0] !== targetColor) {
+            processed++;
+            continue;
+          }
+
+          let xL = x0;
+          while (xL >= 0 && next[row + xL] === targetColor) xL--;
+          xL++;
+          let xR = x0;
+          while (xR < w && next[row + xR] === targetColor) xR++;
+          xR--;
+
+          for (let x = xL; x <= xR; x++) {
+            const i = row + x;
+            next[i] = newColorId;
+            if (indices) indices.push(i);
+          }
+          filledAny = true;
+          scanRow(y0 - 1, xL, xR);
+          scanRow(y0 + 1, xL, xR);
+          processed++;
+        }
+
+        if (sp > 0) {
+          requestAnimationFrame(step);
+        } else {
+          resolve({ next, filled: filledAny, indices });
+        }
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
+  async function fillRegion(startX: number, startY: number, newColorId: number) {
+    const gridSnapshot = gridRef.current;
+    const startIdx = idx(startX, startY, width);
+    const targetColor = gridSnapshot[startIdx];
+    if (targetColor === newColorId) return;
+
+    const token = ++fillTokenRef.current;
+    const collectIndices = !onFillGrid && Boolean(onFillCells);
+    const maxCells = width * height;
+    // Optional chunking for very large fills to keep the UI responsive.
+    const shouldChunk = typeof requestAnimationFrame === "function" && maxCells > 240000;
+
+    const result = shouldChunk
+      ? await scanlineFillChunked(
+          gridSnapshot,
+          startX,
+          startY,
+          targetColor,
+          newColorId,
+          collectIndices,
+          token,
+          1800
+        )
+      : scanlineFillSync(gridSnapshot, startX, startY, targetColor, newColorId, collectIndices);
+
+    if (!result || !result.filled) return;
     if (fillTokenRef.current !== token) return;
+    if (gridRef.current !== gridSnapshot) return;
+
     if (onFillGrid) {
-      onFillGrid(next);
-    } else if (onFillCells) {
-      const cells: number[] = [];
-      for (let i = 0; i < next.length; i++) {
-        if (gridSnapshot[i] === 0 && next[i] === colorId) {
-          cells.push(i);
-        }
-      }
-      onFillCells(cells, colorId);
-    } else {
-      for (let i = 0; i < next.length; i++) {
-        if (gridSnapshot[i] === 0 && next[i] === colorId) {
-          const x = i % width;
-          const y = Math.floor(i / width);
-          onPaintCell(x, y, colorId);
-        }
-      }
+      onFillGrid(result.next);
+    } else if (onFillCells && result.indices) {
+      onFillCells(result.indices, newColorId);
     }
   }
 
@@ -767,6 +719,7 @@ export default function GridCanvas(props: Props) {
 
   const alignX = canvasW <= containerWidth ? "center" : "flex-start";
   const alignY = canvasH <= containerHeight ? "center" : "flex-start";
+  const effectivePanMode = panMode && !(traceAdjustMode && traceImage);
 
   return (
     <div
@@ -780,9 +733,9 @@ export default function GridCanvas(props: Props) {
         width: containerWidth || canvasW,
         height: containerHeight || canvasH,
         overflow: "hidden",
-        borderRadius: 8,
-        background: "rgba(255,255,255,0.08)",
-        boxShadow: "inset 0 0 0 2px rgba(255,255,255,0.6)",
+        borderRadius: 0,
+        background: "rgba(15,23,42,0.03)",
+        boxShadow: "inset 0 0 0 1px rgba(15,23,42,0.15)",
         touchAction: "none",
       }}
     >
@@ -794,15 +747,19 @@ export default function GridCanvas(props: Props) {
           transform: `translate(${panByCanvasX ? panOffset.x : 0}px, ${panByCanvasY ? panOffset.y : 0}px)`,
           touchAction: "none",
           cursor:
-            panMode
+            effectivePanMode
               ? "grab"
+              : traceAdjustMode && traceImage
+                ? "grab"
               : tool === "paint"
-              ? "url(/brush_cursor.cur) 0 31, auto"
+              ? `url(${assetPath("/brush_cursor.cur")}) 0 31, auto`
               : tool === "eraser"
-                ? "url(/eraser_cursor.cur) 0 31, auto"
+                ? `url(${assetPath("/eraser_cursor.cur")}) 0 31, auto`
                 : tool === "eyedropper"
-                  ? "url(/dropper_cursor.cur) 0 31, auto"
-                  : "auto",
+                  ? `url(${assetPath("/dropper_cursor.cur")}) 0 31, auto`
+                  : tool === "fill"
+                    ? "cell"
+                    : "auto",
         }}
         onContextMenu={(e) => {
           e.preventDefault();
@@ -812,7 +769,7 @@ export default function GridCanvas(props: Props) {
             e.preventDefault();
             (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
           }
-          if (panMode || e.button === 2) {
+          if (effectivePanMode || e.button === 2) {
             e.preventDefault();
             (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
             isPanningRef.current = true;
@@ -863,7 +820,13 @@ export default function GridCanvas(props: Props) {
             paintStamp(cell.x, cell.y, colorId);
             return;
           }
-          // Fill tool disabled
+          if (tool === "fill") {
+            if (pinchEnabled && pinchActiveRef.current) return;
+            const cell = getCellFromEvent(e);
+            if (!cell) return;
+            void fillRegion(cell.x, cell.y, activeColorId);
+            return;
+          }
           if (tool === "eyedropper") {
             if (pinchEnabled && pinchActiveRef.current) return;
             const cell = getCellFromEvent(e);

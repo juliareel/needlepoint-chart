@@ -5,6 +5,8 @@ import type { Color } from "../lib/grid";
 
 type Props = {
   palette: Color[];
+  extractedIds?: number[];
+  showExtractedFilter?: boolean;
   activeColorId: number;
   onSelect: (id: number) => void;
   remapSourceId?: number | null;
@@ -14,6 +16,8 @@ type Props = {
 
 export default function Palette({
   palette,
+  extractedIds,
+  showExtractedFilter = true,
   activeColorId,
   onSelect,
   remapSourceId,
@@ -58,6 +62,7 @@ export default function Palette({
     palette.forEach((c) => {
       if (c.family) set.add(c.family);
     });
+    set.delete("Extracted");
     const order = [
       "All",
       "Red",
@@ -77,9 +82,15 @@ export default function Palette({
     const rest = Array.from(set).filter((f) => !order.includes(f)).sort();
     return ["All", ...order.filter((f) => f !== "All" && set.has(f)), ...rest];
   }, [palette]);
+  const extractedSet = useMemo(() => new Set(extractedIds ?? []), [extractedIds]);
+  const hasExtracted = extractedSet.size > 0;
   const filteredPalette = useMemo(() => {
     const familyFiltered =
-      activeFamily === "All" ? sortedPalette : sortedPalette.filter((c) => c.family === activeFamily);
+      activeFamily === "Extracted"
+        ? sortedPalette.filter((c) => extractedSet.has(c.id))
+        : activeFamily === "All"
+          ? sortedPalette
+          : sortedPalette.filter((c) => c.family === activeFamily);
     const q = query.trim().toLowerCase();
     if (!q) return familyFiltered;
     return familyFiltered.filter((c) => {
@@ -87,12 +98,11 @@ export default function Palette({
       const code = (c.code ?? "").toLowerCase();
       return name.includes(q) || code.includes(q) || `#${code}`.includes(q);
     });
-  }, [sortedPalette, activeFamily, query]);
+  }, [sortedPalette, activeFamily, query, extractedSet]);
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <div>
-        <div style={{ fontWeight: 600, marginBottom: 6 }}>Palette</div>
         <div style={{ display: "grid", gap: 8, marginBottom: 8 }}>
           <input
             value={query}
@@ -106,25 +116,66 @@ export default function Palette({
               color: "var(--foreground)",
             }}
           />
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 12, opacity: 0.7 }}>Family</span>
-          <select
-            value={activeFamily}
-            onChange={(e) => setActiveFamily(e.target.value)}
-            style={{
-              padding: "6px 8px",
-              borderRadius: 8,
-              border: "1px solid var(--panel-border)",
-              background: "transparent",
-              color: "var(--foreground)",
-            }}
-          >
-            {families.map((family) => (
-              <option key={family} value={family}>
-                {family}
-              </option>
-            ))}
-          </select>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, opacity: 0.7 }}>Family</span>
+            <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+              <select
+                value={activeFamily === "Extracted" ? "All" : activeFamily}
+                onChange={(e) => setActiveFamily(e.target.value)}
+                style={{
+                  padding: "6px 28px 6px 10px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "#f3f3f3",
+                  color: "var(--foreground)",
+                  fontWeight: 600,
+                  appearance: "none",
+                  WebkitAppearance: "none",
+                  MozAppearance: "none",
+                }}
+              >
+                {families.map((family) => (
+                  <option key={family} value={family}>
+                    {family}
+                  </option>
+                ))}
+              </select>
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  right: 8,
+                  fontSize: 12,
+                  opacity: 0.6,
+                  pointerEvents: "none",
+                }}
+              >
+                ▾
+              </span>
+            </div>
+            {showExtractedFilter && hasExtracted && (
+              <button
+                type="button"
+                onClick={() => setActiveFamily(activeFamily === "Extracted" ? "All" : "Extracted")}
+                style={{
+                  padding: "6px 8px",
+                  borderRadius: 8,
+                  border: activeFamily === "Extracted" ? "1px solid #c26d9a" : "none",
+                  background: activeFamily === "Extracted" ? "rgb(255 224 237)" : "#f3f3f3",
+                  color: activeFamily === "Extracted" ? "#a84a7b" : "var(--foreground)",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  textAlign: "center",
+                }}
+              >
+                <span style={{ display: "block", lineHeight: 1.1, textAlign: "center" }}>
+                  <span style={{ display: "block" }}>Image</span>
+                  <span style={{ display: "block" }}>Colors</span>
+                </span>
+              </button>
+            )}
           </div>
         </div>
         <div

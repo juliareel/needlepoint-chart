@@ -8,6 +8,7 @@ import type { Color } from "../lib/grid";
 import { idx, makeGrid } from "../lib/grid";
 import { DMC_COLORS } from "../lib/dmcColors";
 import { symbolForColorId } from "../lib/symbols";
+import { assetPath } from "../lib/assetPath";
 
 const DEFAULT_PALETTE: Color[] = DMC_COLORS;
 const EXPORT_CELL_SIZE = 24;
@@ -29,8 +30,343 @@ function pointInPolygon(point: Point, polygon: Point[]) {
   return inside;
 }
 
+type LabSamples = { values: Float32Array; count: number };
+
+function srgbToLinear(value: number) {
+  return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(value: number) {
+  return value <= 0.0031308 ? value * 12.92 : 1.055 * Math.pow(value, 1 / 2.4) - 0.055;
+}
+
+function rgbToOklab(r: number, g: number, b: number) {
+  const lr = srgbToLinear(r);
+  const lg = srgbToLinear(g);
+  const lb = srgbToLinear(b);
+  const l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
+  const m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
+  const s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
+  const l_ = Math.cbrt(l);
+  const m_ = Math.cbrt(m);
+  const s_ = Math.cbrt(s);
+  return {
+    L: 0.2104542553 * l_ + 0.793617785 * m_ - 0.0040720468 * s_,
+    A: 1.9779984951 * l_ - 2.428592205 * m_ + 0.4505937099 * s_,
+    B: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.808675766 * s_,
+  };
+}
+
+function oklabToRgb(L: number, A: number, B: number) {
+  const l_ = L + 0.3963377774 * A + 0.2158037573 * B;
+  const m_ = L - 0.1055613458 * A - 0.0638541728 * B;
+  const s_ = L - 0.0894841775 * A - 1.291485548 * B;
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+  const lr = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+  const lg = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+  const lb = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
+  return { r: linearToSrgb(lr), g: linearToSrgb(lg), b: linearToSrgb(lb) };
+}
+
+function clamp01(value: number) {
+  return Math.min(1, Math.max(0, value));
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  const toHex = (value: number) => Math.round(clamp01(value) * 255).toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+function sampleTraceImageOklab(image: HTMLImageElement, maxSamples: number): LabSamples {
+  const width = image.width;
+  const height = image.height;
+  if (width <= 0 || height <= 0) return { values: new Float32Array(0), count: 0 };
+  const total = width * height;
+  const scale = total > maxSamples ? Math.sqrt(maxSamples / total) : 1;
+  const sampleW = Math.max(1, Math.round(width * scale));
+  const sampleH = Math.max(1, Math.round(height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = sampleW;
+  canvas.height = sampleH;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return { values: new Float32Array(0), count: 0 };
+  ctx.drawImage(image, 0, 0, sampleW, sampleH);
+  const data = ctx.getImageData(0, 0, sampleW, sampleH).data;
+  const values = new Float32Array(sampleW * sampleH * 3);
+  let count = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 16) continue;
+    const { L, A, B } = rgbToOklab(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255);
+    const offset = count * 3;
+    values[offset] = L;
+    values[offset + 1] = A;
+    values[offset + 2] = B;
+    count += 1;
+  }
+  return { values, count };
+}
+
+function kMeansOklab(samples: LabSamples, k: number, iterations = 8) {
+  const count = samples.count;
+  const values = samples.values;
+  if (count === 0 || k <= 0) {
+    return { centers: new Float32Array(0), counts: new Int32Array(0) };
+  }
+  const centers = new Float32Array(k * 3);
+  const counts = new Int32Array(k);
+  const nearestDist = new Float32Array(count);
+
+  let meanL = 0;
+  let meanA = 0;
+  let meanB = 0;
+  for (let i = 0; i < count; i++) {
+    meanL += values[i * 3];
+    meanA += values[i * 3 + 1];
+    meanB += values[i * 3 + 2];
+  }
+  meanL /= count;
+  meanA /= count;
+  meanB /= count;
+  let first = 0;
+  let maxDist = -1;
+  for (let i = 0; i < count; i++) {
+    const dx = values[i * 3] - meanL;
+    const dy = values[i * 3 + 1] - meanA;
+    const dz = values[i * 3 + 2] - meanB;
+    const dist = dx * dx + dy * dy + dz * dz;
+    if (dist > maxDist) {
+      maxDist = dist;
+      first = i;
+    }
+  }
+  centers[0] = values[first * 3];
+  centers[1] = values[first * 3 + 1];
+  centers[2] = values[first * 3 + 2];
+  for (let i = 0; i < count; i++) {
+    const dx = values[i * 3] - centers[0];
+    const dy = values[i * 3 + 1] - centers[1];
+    const dz = values[i * 3 + 2] - centers[2];
+    nearestDist[i] = dx * dx + dy * dy + dz * dz;
+  }
+
+  for (let c = 1; c < k; c++) {
+    let farthest = 0;
+    let farthestDist = -1;
+    for (let i = 0; i < count; i++) {
+      const dist = nearestDist[i];
+      if (dist > farthestDist) {
+        farthestDist = dist;
+        farthest = i;
+      }
+    }
+    const base = c * 3;
+    centers[base] = values[farthest * 3];
+    centers[base + 1] = values[farthest * 3 + 1];
+    centers[base + 2] = values[farthest * 3 + 2];
+    for (let i = 0; i < count; i++) {
+      const dx = values[i * 3] - centers[base];
+      const dy = values[i * 3 + 1] - centers[base + 1];
+      const dz = values[i * 3 + 2] - centers[base + 2];
+      const dist = dx * dx + dy * dy + dz * dz;
+      if (dist < nearestDist[i]) nearestDist[i] = dist;
+    }
+  }
+
+  const sums = new Float32Array(k * 3);
+
+  for (let iter = 0; iter < iterations; iter++) {
+    counts.fill(0);
+    sums.fill(0);
+    for (let i = 0; i < count; i++) {
+      let best = 0;
+      let bestDist = Number.POSITIVE_INFINITY;
+      const px = values[i * 3];
+      const py = values[i * 3 + 1];
+      const pz = values[i * 3 + 2];
+      for (let c = 0; c < k; c++) {
+        const base = c * 3;
+        const dx = px - centers[base];
+        const dy = py - centers[base + 1];
+        const dz = pz - centers[base + 2];
+        const dist = dx * dx + dy * dy + dz * dz;
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = c;
+        }
+      }
+      counts[best] += 1;
+      const sumBase = best * 3;
+      sums[sumBase] += px;
+      sums[sumBase + 1] += py;
+      sums[sumBase + 2] += pz;
+    }
+    for (let c = 0; c < k; c++) {
+      const countC = counts[c];
+      const base = c * 3;
+      if (countC > 0) {
+        centers[base] = sums[base] / countC;
+        centers[base + 1] = sums[base + 1] / countC;
+        centers[base + 2] = sums[base + 2] / countC;
+      } else {
+        let farthest = 0;
+        let farthestDist = -1;
+        for (let i = 0; i < count; i++) {
+          let bestDist = Number.POSITIVE_INFINITY;
+          const px = values[i * 3];
+          const py = values[i * 3 + 1];
+          const pz = values[i * 3 + 2];
+          for (let s = 0; s < k; s++) {
+            const sBase = s * 3;
+            const dx = px - centers[sBase];
+            const dy = py - centers[sBase + 1];
+            const dz = pz - centers[sBase + 2];
+            const dist = dx * dx + dy * dy + dz * dz;
+            if (dist < bestDist) bestDist = dist;
+          }
+          if (bestDist > farthestDist) {
+            farthestDist = bestDist;
+            farthest = i;
+          }
+        }
+        centers[base] = values[farthest * 3];
+        centers[base + 1] = values[farthest * 3 + 1];
+        centers[base + 2] = values[farthest * 3 + 2];
+      }
+    }
+  }
+
+  return { centers, counts };
+}
+
+function selectDiverseClusters(centers: Float32Array, counts: Int32Array, targetCount: number) {
+  const k = counts.length;
+  const available: number[] = [];
+  let maxCount = 0;
+  for (let c = 0; c < k; c++) {
+    const count = counts[c];
+    if (count > 0) {
+      available.push(c);
+      if (count > maxCount) maxCount = count;
+    }
+  }
+  if (available.length <= targetCount) return available;
+  let bestIndex = available[0];
+  for (const idx of available) {
+    if (counts[idx] > counts[bestIndex]) bestIndex = idx;
+  }
+  const selected = [bestIndex];
+  const selectedSet = new Set<number>(selected);
+  const distanceWeight = 1.8;
+  const importanceWeight = 0.6;
+  const rarityBoost = 1.2;
+  const hueWeight = 0.6;
+  const chromaWeight = 0.5;
+  const hueBins = 12;
+
+  const chromaByIndex = new Float32Array(k);
+  const hueByIndex = new Float32Array(k);
+  for (let i = 0; i < k; i++) {
+    const base = i * 3;
+    const a = centers[base + 1];
+    const b = centers[base + 2];
+    const chroma = Math.sqrt(a * a + b * b);
+    chromaByIndex[i] = chroma;
+    let hue = Math.atan2(b, a);
+    if (hue < 0) hue += Math.PI * 2;
+    hueByIndex[i] = hue;
+  }
+  const hueBinCounts = new Int32Array(hueBins);
+  const startHue = hueByIndex[bestIndex];
+  const startBin = Math.min(hueBins - 1, Math.floor((startHue / (Math.PI * 2)) * hueBins));
+  hueBinCounts[startBin] += 1;
+
+  while (selected.length < targetCount) {
+    let nextIndex = -1;
+    let bestScore = -1;
+    for (const idx of available) {
+      if (selectedSet.has(idx)) continue;
+      const importance = Math.log1p(counts[idx]) / Math.log1p(maxCount);
+      const base = idx * 3;
+      let minDist = Number.POSITIVE_INFINITY;
+      let minHueDist = Number.POSITIVE_INFINITY;
+      for (const sel of selected) {
+        const selBase = sel * 3;
+        const dx = centers[base] - centers[selBase];
+        const dy = centers[base + 1] - centers[selBase + 1];
+        const dz = centers[base + 2] - centers[selBase + 2];
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < minDist) minDist = dist;
+        const hueA = hueByIndex[idx];
+        const hueB = hueByIndex[sel];
+        const diff = Math.abs(hueA - hueB);
+        const hueDist = Math.min(diff, Math.PI * 2 - diff);
+        if (hueDist < minHueDist) minHueDist = hueDist;
+      }
+      const chroma = chromaByIndex[idx];
+      const chromaFactor = chroma / (chroma + 0.05);
+      const hueScore = hueWeight * minHueDist * chromaFactor;
+      const bin = Math.min(hueBins - 1, Math.floor((hueByIndex[idx] / (Math.PI * 2)) * hueBins));
+      const binPenalty = 1 / (1 + hueBinCounts[bin] * 0.8);
+      const score =
+        (importanceWeight * importance +
+          distanceWeight * minDist +
+          rarityBoost * (1 - importance) * minDist +
+          hueScore +
+          chromaWeight * chroma * (1 - importance)) *
+        binPenalty;
+      if (score > bestScore) {
+        bestScore = score;
+        nextIndex = idx;
+      }
+    }
+    if (nextIndex === -1) break;
+    selected.push(nextIndex);
+    selectedSet.add(nextIndex);
+    const hue = hueByIndex[nextIndex];
+    const bin = Math.min(hueBins - 1, Math.floor((hue / (Math.PI * 2)) * hueBins));
+    hueBinCounts[bin] += 1;
+  }
+  return selected;
+}
+
+  function extractPaletteFromImage(image: HTMLImageElement, maxColors: number) {
+  const maxSamples = 40000;
+  const samples = sampleTraceImageOklab(image, maxSamples);
+  if (samples.count === 0) return [];
+  const target = Math.max(2, Math.min(maxColors, samples.count));
+  const overCluster = Math.min(samples.count, Math.max(target * 5, Math.round(target * 6)));
+  const { centers, counts } = kMeansOklab(samples, overCluster, 8);
+  const selected = selectDiverseClusters(centers, counts, target);
+  const seen = new Set<string>();
+  const palette: string[] = [];
+  for (const idx of selected) {
+    const base = idx * 3;
+    const rgb = oklabToRgb(centers[base], centers[base + 1], centers[base + 2]);
+    const hex = rgbToHex(rgb.r, rgb.g, rgb.b);
+    if (seen.has(hex)) continue;
+    seen.add(hex);
+    palette.push(hex);
+    if (palette.length >= target) break;
+  }
+  if (palette.length < target) {
+    const order = Array.from({ length: counts.length }, (_, i) => i).sort((a, b) => counts[b] - counts[a]);
+    for (const idx of order) {
+      const base = idx * 3;
+      const rgb = oklabToRgb(centers[base], centers[base + 1], centers[base + 2]);
+      const hex = rgbToHex(rgb.r, rgb.g, rgb.b);
+      if (seen.has(hex)) continue;
+      seen.add(hex);
+      palette.push(hex);
+      if (palette.length >= target) break;
+    }
+  }
+  return palette;
+}
+
 export default function PatternEditor() {
-  const [title, setTitle] = useState("My Needlepoint Pattern");
+  const [title, setTitle] = useState("Untitled Pattern");
   const [isNarrow, setIsNarrow] = useState(false);
   const [isCompact, setIsCompact] = useState(false);
 
@@ -41,7 +377,7 @@ export default function PatternEditor() {
   const [future, setFuture] = useState<Snapshot[]>([]);
   const historyRef = useRef<Snapshot[]>([]);
   const futureRef = useRef<Snapshot[]>([]);
-  const [tool, setTool] = useState<"paint" | "eraser" | "eyedropper" | "lasso">("paint");
+  const [tool, setTool] = useState<"paint" | "eraser" | "fill" | "eyedropper" | "lasso">("paint");
   const [brushSize, setBrushSize] = useState(1);
   const [lassoPoints, setLassoPoints] = useState<Point[]>([]);
   const [lassoClosed, setLassoClosed] = useState(false);
@@ -59,8 +395,10 @@ export default function PatternEditor() {
   const [darkCanvas, setDarkCanvas] = useState(false);
   const [showSymbols, setShowSymbols] = useState(false);
   const [gridOpen, setGridOpen] = useState(true);
+  const [traceOpen, setTraceOpen] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const [canvasSettingsOpen, setCanvasSettingsOpen] = useState(true);
+  const [usedColorsOpen, setUsedColorsOpen] = useState(true);
   const [traceImageUrl, setTraceImageUrl] = useState<string | null>(null);
   const [traceFileName, setTraceFileName] = useState<string | null>(null);
   const [traceImage, setTraceImage] = useState<HTMLImageElement | null>(null);
@@ -69,7 +407,6 @@ export default function PatternEditor() {
   const [traceOffsetX, setTraceOffsetX] = useState(0);
   const [traceOffsetY, setTraceOffsetY] = useState(0);
   const [traceLocked, setTraceLocked] = useState(false);
-  const [configTab, setConfigTab] = useState<"grid" | "trace">("grid");
   const [panMode, setPanMode] = useState(false);
   const traceUrlRef = useRef<string | null>(null);
   const strokeActiveRef = useRef(false);
@@ -80,16 +417,24 @@ export default function PatternEditor() {
   const gridRef = useRef<Uint16Array | null>(null);
 
   const [palette, setPalette] = useState<Color[]>(DEFAULT_PALETTE);
+  const [extractedPaletteIds, setExtractedPaletteIds] = useState<number[]>([]);
   const paletteById = useMemo(() => new Map(palette.map((c) => [c.id, c])), [palette]);
+  const extractedIds = useMemo(
+    () => extractedPaletteIds.filter((id) => paletteById.has(id)),
+    [extractedPaletteIds, paletteById]
+  );
 
   const [activeColorId, setActiveColorId] = useState<number>(DEFAULT_PALETTE[3].id);
+  const [extractPaletteSize, setExtractPaletteSize] = useState(12);
+  const [extractingPalette, setExtractingPalette] = useState(false);
+  const [extractPaletteOpen, setExtractPaletteOpen] = useState(false);
   const [remapSourceId, setRemapSourceId] = useState<number | null>(null);
   const [remapTargetId, setRemapTargetId] = useState<number | null>(null);
   const draftInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (isNarrow) {
-      setCanvasSettingsOpen(false);
+      // setCanvasSettingsOpen(false);
       setPaletteOpen(false);
     }
   }, [isNarrow]);
@@ -165,10 +510,13 @@ export default function PatternEditor() {
     };
   }, []);
 
+  const canvasCardPadding = 12;
+  const canvasInnerWidth = Math.max(1, canvasAreaWidth - canvasCardPadding * 2);
+
   const fitCellSize = useMemo(() => {
-    if (canvasAreaWidth <= 0) return 1;
-    return Math.max(1, canvasAreaWidth / gridW);
-  }, [canvasAreaWidth, gridW]);
+    if (canvasInnerWidth <= 0) return 1;
+    return Math.max(1, canvasInnerWidth / gridW);
+  }, [canvasInnerWidth, gridW]);
 
   const prevFitCellSizeRef = useRef(fitCellSize);
 
@@ -176,7 +524,7 @@ export default function PatternEditor() {
     return Math.max(1, Number((fitCellSize * zoom).toFixed(2)));
   }, [fitCellSize, zoom]);
 
-  const containerWidth = Math.max(1, canvasAreaWidth);
+  const containerWidth = Math.max(1, canvasInnerWidth);
   const containerHeight = Math.max(1, Math.round((containerWidth * gridH) / gridW));
   const canvasW = gridW * displayCellSize;
   const canvasH = gridH * displayCellSize;
@@ -393,7 +741,57 @@ export default function PatternEditor() {
     applyGridFromInches(draftWidthIn, draftHeightIn, draftMeshCount);
   }
 
+  function hasPaintedCells() {
+    const current = gridRef.current ?? grid;
+    for (let i = 0; i < current.length; i++) {
+      if (current[i] !== 0) return true;
+    }
+    return false;
+  }
+
+  function confirmAndApplyGrid() {
+    if (hasPaintedCells()) {
+      const ok = window.confirm(
+        "Changing the grid size will clear your current stitches. Do you want to continue?"
+      );
+      if (!ok) return;
+    }
+    applyDraftGrid();
+  }
+
+  function toggleTraceLock() {
+    if (!traceImage) return;
+    if (traceLocked) {
+      if (hasPaintedCells()) {
+        const ok = window.confirm(
+          "Unlocking the trace image after painting may misalign it with your stitches. Do you want to continue?"
+        );
+        if (!ok) return;
+      }
+      setTraceLocked(false);
+      return;
+    }
+    setTraceLocked(true);
+  }
+
+  function setTraceLockedState(nextLocked: boolean) {
+    if (!traceImage) return;
+    if (!nextLocked && traceLocked) {
+      if (hasPaintedCells()) {
+        const ok = window.confirm(
+          "Unlocking the background image after painting may misalign it with your stitches. Do you want to continue?"
+        );
+        if (!ok) return;
+      }
+    }
+    setTraceLocked(nextLocked);
+  }
+
   function clearGrid() {
+    if (hasPaintedCells()) {
+      const ok = window.confirm("This will clear all painted cells. Do you want to continue?");
+      if (!ok) return;
+    }
     bumpStrokeVersion();
     updateGrid(() => makeGrid(gridW, gridH, 0));
   }
@@ -488,6 +886,70 @@ export default function PatternEditor() {
       return [...prev, { id: nextId, name, hex, family: "Custom" }];
     });
   }
+
+  async function extractPaletteFromTrace() {
+    if (!traceImage || extractingPalette) return;
+    const targetSize = Math.max(2, Math.min(32, Math.floor(extractPaletteSize)));
+    setExtractingPalette(true);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const hexes = extractPaletteFromImage(traceImage, targetSize);
+    setExtractingPalette(false);
+    if (hexes.length === 0) return;
+    const toRgb = (hex: string) => {
+      const clean = hex.replace("#", "");
+      if (clean.length !== 6) return null;
+      const r = parseInt(clean.slice(0, 2), 16) / 255;
+      const g = parseInt(clean.slice(2, 4), 16) / 255;
+      const b = parseInt(clean.slice(4, 6), 16) / 255;
+      if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+      return { r, g, b };
+    };
+
+    const paletteLabs = palette
+      .map((c) => {
+        const rgb = toRgb(c.hex);
+        if (!rgb) return null;
+        const lab = rgbToOklab(rgb.r, rgb.g, rgb.b);
+        return { id: c.id, L: lab.L, A: lab.A, B: lab.B };
+      })
+      .filter((entry): entry is { id: number; L: number; A: number; B: number } => Boolean(entry));
+
+    const picked: number[] = [];
+    const seen = new Set<number>();
+    for (const hex of hexes) {
+      const rgb = toRgb(hex);
+      if (!rgb) continue;
+      const lab = rgbToOklab(rgb.r, rgb.g, rgb.b);
+      let bestId: number | null = null;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (const candidate of paletteLabs) {
+        if (seen.has(candidate.id)) continue;
+        const dx = lab.L - candidate.L;
+        const dy = lab.A - candidate.A;
+        const dz = lab.B - candidate.B;
+        const dist = dx * dx + dy * dy + dz * dz;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestId = candidate.id;
+        }
+      }
+      if (bestId == null) continue;
+      seen.add(bestId);
+      picked.push(bestId);
+    }
+
+    if (picked.length === 0) return;
+    setExtractedPaletteIds(picked);
+    setActiveColorId(picked[0]);
+  }
+
+  const cardStyle = {
+    background: "#ffffff",
+    border: "none",
+    borderRadius: 12,
+    padding: 12,
+    boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
+  } as const;
 
   function replaceColor(sourceId: number, targetId: number) {
     if (sourceId === targetId) {
@@ -633,7 +1095,7 @@ export default function PatternEditor() {
       try {
         const parsed = JSON.parse(reader.result as string);
         if (!parsed || parsed.version !== 1) return;
-        setTitle(parsed.title || "My Needlepoint Pattern");
+        setTitle(parsed.title || "Untitled Pattern");
         setGridW(parsed.gridW);
         setGridH(parsed.gridH);
         const expectedSize = parsed.gridW * parsed.gridH;
@@ -656,7 +1118,7 @@ export default function PatternEditor() {
         setActiveColorId(parsed.activeColorId || DEFAULT_PALETTE[0].id);
         setShowGridlines(Boolean(parsed.showGridlines));
         setThreadView(Boolean(parsed.threadView));
-        setDarkCanvas(Boolean(parsed.darkCanvas));
+        // setDarkCanvas(Boolean(parsed.darkCanvas));
         setShowSymbols(Boolean(parsed.showSymbols));
         setZoom(clampZoom(parsed.zoom || 1));
         setHistoryState([]);
@@ -755,110 +1217,121 @@ export default function PatternEditor() {
   }
 
   const usedColorsSection = (
-    <div style={{ border: "1px solid var(--panel-border)", borderRadius: 12, padding: 12 }}>
-      <div style={{ fontWeight: 600, marginBottom: 8 }}>Used colors</div>
-      <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>
-        Click a color to replace it.
-      </div>
-      {remapSourceId !== null && (
-        <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-          Pick a replacement color from the palette, then press OK to apply.
-          <button
-            onClick={cancelRemap}
-            style={{
-              marginLeft: 8,
-              padding: "2px 8px",
-              borderRadius: 999,
-              border: "1px solid var(--foreground)",
-              background: "transparent",
-              color: "var(--foreground)",
-              cursor: "pointer",
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={confirmRemap}
-            style={{
-              marginLeft: 8,
-              padding: "2px 8px",
-              borderRadius: 999,
-              border: "1px solid var(--foreground)",
-              background: "var(--foreground)",
-              color: "var(--background)",
-              cursor: "pointer",
-            }}
-          >
-            OK
-          </button>
-        </div>
-      )}
-      <div style={{ display: "grid", gap: 6 }}>
-        {usedColors.length === 0 ? (
-          <div style={{ opacity: 0.7 }}>None yet.</div>
-        ) : (
-          usedColors.slice(0, 12).map(({ color, count }) => (
-            <button
-              key={color.id}
-              onClick={() => beginRemap(color.id)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                padding: "4px 6px",
-                borderRadius: 8,
-                border: remapSourceId === color.id ? "2px solid var(--foreground)" : "1px solid transparent",
-                background: "transparent",
-                cursor: "pointer",
-                textAlign: "left",
-              }}
-              aria-label={`Replace ${color.name}`}
-            >
-              <span
+    <div style={cardStyle}>
+      <button
+        onClick={() => setUsedColorsOpen((open) => !open)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+          border: "none",
+          background: "transparent",
+          padding: 0,
+          marginBottom: usedColorsOpen ? 8 : 0,
+          cursor: "pointer",
+          fontWeight: 600,
+        }}
+        type="button"
+      >
+        <span>Used colors</span>
+        <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
+          {usedColorsOpen ? "▾" : "▸"}
+        </span>
+      </button>
+      {usedColorsOpen && (
+        <>
+          <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>
+            Click a color to replace it.
+          </div>
+          {remapSourceId !== null && (
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+              Pick a replacement color from the palette, then press OK to apply.
+              <button
+                onClick={cancelRemap}
                 style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: 4,
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: color.hex,
-                  display: "inline-block",
+                  marginLeft: 8,
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "none",
+                  background: "#f3f3f3",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
                 }}
-              />
-              <span style={{ fontSize: 13 }}>
-                {color.code ? `#${color.code} ` : ""}
-                {color.name} ({count})
-              </span>
-            </button>
-          ))
-        )}
-      </div>
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmRemap}
+                style={{
+                  marginLeft: 8,
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "1px solid var(--foreground)",
+                  background: "var(--foreground)",
+                  color: "var(--background)",
+                  cursor: "pointer",
+                }}
+              >
+                OK
+              </button>
+            </div>
+          )}
+          <div style={{ display: "grid", gap: 6 }}>
+            {usedColors.length === 0 ? (
+              <div style={{ opacity: 0.7 }}>None yet.</div>
+            ) : (
+              usedColors.slice(0, 12).map(({ color, count }) => (
+                <button
+                  key={color.id}
+                  onClick={() => beginRemap(color.id)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "4px 6px",
+                    borderRadius: 8,
+                    border:
+                      remapSourceId === color.id ? "2px solid var(--foreground)" : "1px solid transparent",
+                    background: "transparent",
+                    cursor: "pointer",
+                    textAlign: "left",
+                  }}
+                  aria-label={`Replace ${color.name}`}
+                >
+                  <span
+                    style={{
+                      width: 14,
+                      height: 14,
+                      borderRadius: 4,
+                      border: "1px solid rgba(0,0,0,0.2)",
+                      background: color.hex,
+                      display: "inline-block",
+                    }}
+                  />
+                  <span style={{ fontSize: 13 }}>
+                    {color.code ? `#${color.code} ` : ""}
+                    {color.name} ({count})
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 
   return (
       <div
         className="pattern-editor"
-        style={{ display: "grid", gap: 12, padding: 16, maxWidth: "100%", margin: "0 auto" }}
+        style={{ display: "grid", gap: 12, padding: 0, width: "100%", maxWidth: "100%", margin: "0 auto" }}
       >
-      {!isNarrow && (
-        <div style={{ display: "flex", justifyContent: "flex-end" }}>
-          <ExportPdfButton
-            title={title}
-            canvasRef={exportCanvasRef}
-            usedColors={usedColors}
-            grid={grid}
-            paletteById={paletteById}
-            width={gridW}
-            height={gridH}
-            cellSize={EXPORT_CELL_SIZE}
-          />
-        </div>
-      )}
       <div
         className="pattern-main"
         style={{
           display: "flex",
-          gap: 16,
+          gap: 24,
           alignItems: "flex-start",
           flexDirection: isNarrow ? "column" : "row",
           width: "100%",
@@ -875,8 +1348,7 @@ export default function PatternEditor() {
             width: isNarrow ? "100%" : undefined,
           }}
         >
-          <div style={{ display: "grid", gap: 6 }}>
-            <div style={{ fontWeight: 700 }}>Needlepoint Pattern Editor (MVP)</div>
+          <div style={{ ...cardStyle, display: "grid", gap: 8 }}>
             <input
               value={title}
               onChange={(e) => setTitle(e.target.value)}
@@ -888,8 +1360,8 @@ export default function PatternEditor() {
                 style={{
                   padding: "6px 10px",
                   borderRadius: 8,
-                  border: "1px solid var(--foreground)",
-                  background: "transparent",
+                  border: "none",
+                      background: "#f3f3f3",
                   color: "var(--foreground)",
                   cursor: "pointer",
                 }}
@@ -901,8 +1373,8 @@ export default function PatternEditor() {
                 style={{
                   padding: "6px 10px",
                   borderRadius: 8,
-                  border: "1px solid var(--foreground)",
-                  background: "transparent",
+                  border: "none",
+                      background: "#f3f3f3",
                   color: "var(--foreground)",
                   cursor: "pointer",
                 }}
@@ -922,14 +1394,24 @@ export default function PatternEditor() {
                 style={{ display: "none" }}
               />
             </div>
+            <div style={{ display: "flex", justifyContent: "center" }}>
+              <ExportPdfButton
+                title={title}
+                canvasRef={exportCanvasRef}
+                usedColors={usedColors}
+                grid={grid}
+                paletteById={paletteById}
+                width={gridW}
+                height={gridH}
+                cellSize={EXPORT_CELL_SIZE}
+              />
+            </div>
           </div>
           <div
             style={{
-              border: "1px solid var(--panel-border)",
-              borderRadius: 12,
-              padding: 12,
+              ...cardStyle,
               width: "100%",
-              minHeight: !isNarrow || gridOpen ? 240 : 0,
+              minHeight: gridOpen ? 240 : 0,
               boxSizing: "border-box",
             }}
           >
@@ -943,42 +1425,54 @@ export default function PatternEditor() {
                 border: "none",
                 background: "transparent",
                 padding: 0,
-                marginBottom: gridOpen || !isNarrow ? 12 : 0,
-                cursor: isNarrow ? "pointer" : "default",
+                marginBottom: gridOpen ? 12 : 0,
+                cursor: "pointer",
                 fontWeight: 600,
               }}
               type="button"
             >
-              <span>{configTab === "grid" ? "Grid" : "Trace image"}</span>
-              {isNarrow && <span style={{ opacity: 0.7 }}>{gridOpen ? "▾" : "▸"}</span>}
+              <span>Canvas Size</span>
+              <span style={{ opacity: 0.7 }}>{gridOpen ? "▾" : "▸"}</span>
             </button>
 
-            {(!isNarrow || gridOpen) && (configTab === "grid" ? (
+            {gridOpen && (
               <div style={{ display: "grid", gap: 8, width: "100%" }}>
-                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                  <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <input
-                      type="radio"
-                      name="gridMode"
-                      checked={draftGridMode === "stitches"}
-                      onChange={() => setDraftGridMode("stitches")}
-                    />
-                    Stitches
-                  </label>
-                  <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <input
-                      type="radio"
-                      name="gridMode"
-                      checked={draftGridMode === "inches"}
-                      onChange={() => setDraftGridMode("inches")}
-                    />
-                    Inches + mesh
-                  </label>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    onClick={() => setDraftGridMode("stitches")}
+                    aria-pressed={draftGridMode === "stitches"}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 10,
+                      border: draftGridMode === "stitches" ? "1px solid #c26d9a" : "none",
+                      background: draftGridMode === "stitches" ? "rgb(255 224 237)" : "#f3f3f3",
+                      color: draftGridMode === "stitches" ? "#a84a7b" : "var(--foreground)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Stitch Count
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDraftGridMode("inches")}
+                    aria-pressed={draftGridMode === "inches"}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 10,
+                      border: draftGridMode === "inches" ? "1px solid #c26d9a" : "none",
+                      background: draftGridMode === "inches" ? "rgb(255 224 237)" : "#f3f3f3",
+                      color: draftGridMode === "inches" ? "#a84a7b" : "var(--foreground)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Dimensions
+                  </button>
                 </div>
 
                 {draftGridMode === "stitches" ? (
                   <>
-                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                       <span>Width (stitches)</span>
                     <input
                       type="number"
@@ -988,7 +1482,7 @@ export default function PatternEditor() {
                       style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
-                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                       <span>Height (stitches)</span>
                     <input
                       type="number"
@@ -1001,7 +1495,7 @@ export default function PatternEditor() {
                   </>
                 ) : (
                   <>
-                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                       <span>Width (inches)</span>
                     <input
                       type="number"
@@ -1012,7 +1506,7 @@ export default function PatternEditor() {
                       style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
-                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                       <span>Height (inches)</span>
                     <input
                       type="number"
@@ -1023,7 +1517,7 @@ export default function PatternEditor() {
                       style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
-                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
                       <span>Mesh (stitches/in)</span>
                     <input
                       type="number"
@@ -1035,156 +1529,191 @@ export default function PatternEditor() {
                     </label>
                   </>
                 )}
-                <div style={{ fontSize: 12, opacity: 0.7 }}>
-                  Applying grid settings will reset the canvas and remove painted stitches.
-                </div>
                 <div style={{ display: "flex", justifyContent: "center", gap: 12, alignItems: "center" }}>
                   <button
-                    onClick={() => {
-                      applyDraftGrid();
-                    }}
+                    onClick={confirmAndApplyGrid}
                     style={{
                       padding: "8px 12px",
                       borderRadius: 10,
-                      border: "1px solid var(--foreground)",
-                      background: "var(--foreground)",
-                      color: "var(--background)",
+                      border: "none",
+                      background: "#e48ab0",
+                      color: "#ffffff",
                       cursor: "pointer",
                     }}
                   >
-                    Apply grid
-                  </button>
-                  <button
-                    onClick={() => setConfigTab("trace")}
-                    style={{
-                      padding: "6px 12px",
-                      borderRadius: 10,
-                      border: "1px solid var(--foreground)",
-                      background: "transparent",
-                      color: "var(--foreground)",
-                      cursor: "pointer",
-                    }}
-                  >
-                    {">"}
+                    Apply Size
                   </button>
                 </div>
               </div>
-            ) : (
-              <div style={{ display: "grid", gap: 10, width: "100%" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: 8,
-                  padding: "8px 12px",
-                  borderRadius: 10,
-                  border: "1px solid var(--foreground)",
-                  background: "transparent",
-                  color: "var(--foreground)",
-                  cursor: "pointer",
-                  width: "fit-content",
-                }}
-              >
-                Choose file
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (!file) return;
-                    if (traceUrlRef.current) {
-                      URL.revokeObjectURL(traceUrlRef.current);
-                    }
-                    const url = URL.createObjectURL(file);
-                    traceUrlRef.current = url;
-                    setTraceImageUrl(url);
-                    setTraceFileName(file.name);
-                    setTraceLocked(false);
-                    setTraceOpacity(0.5);
-                  }}
-                  style={{ display: "none" }}
-                />
-              </label>
-              <span style={{ fontSize: 12, opacity: 0.75 }}>
-                {traceFileName ?? "No file chosen"}
-              </span>
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button
-                  onClick={fitTraceToGrid}
-                  disabled={!traceImage || traceLocked}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: 8,
-                    border: "1px solid var(--foreground)",
-                    background: "transparent",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                    opacity: !traceImage || traceLocked ? 0.5 : 1,
-                  }}
-                >
-                  Fit to grid
-                </button>
-                <button
-                  onClick={clearTraceImage}
-                  disabled={!traceImage}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: 8,
-                    border: "1px solid var(--foreground)",
-                    background: "transparent",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                    opacity: traceImage ? 1 : 0.5,
-                  }}
-                >
-                  Remove
-                </button>
-              </div>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>
-                Drag the image to move it. Drag the corners to resize. Clicking Apply locks the image.
-              </div>
-              <div style={{ fontSize: 12, opacity: 0.7, visibility: "hidden" }}>
-                Applying grid settings will reset the canvas and remove painted stitches.
-              </div>
-              <div style={{ display: "flex", justifyContent: "center", gap: 12, alignItems: "center" }}>
-                <button
-                  onClick={() => setConfigTab("grid")}
-                  style={{
-                    padding: "6px 12px",
-                    borderRadius: 10,
-                    border: "1px solid var(--foreground)",
-                    background: "transparent",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                  }}
-                >
-                  {"<"}
-                </button>
-                <button
-                  onClick={() => {
-                    applyDraftGrid();
-                    setTraceLocked(true);
-                  }}
-                  style={{
-                    padding: "8px 12px",
-                    borderRadius: 10,
-                    border: "1px solid var(--foreground)",
-                    background: "var(--foreground)",
-                    color: "var(--background)",
-                    cursor: "pointer",
-                  }}
-                >
-                  Apply trace
-                </button>
-              </div>
-              </div>
-            ))}
+            )}
           </div>
 
-          <div style={{ border: "1px solid var(--panel-border)", borderRadius: 12, padding: 12 }}>
+          <div style={cardStyle}>
+            <button
+              onClick={() => setTraceOpen((open) => !open)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                width: "100%",
+                border: "none",
+                background: "transparent",
+                padding: 0,
+                marginBottom: traceOpen ? 12 : 0,
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+              type="button"
+            >
+              <span>Background Image</span>
+              <span style={{ opacity: 0.7 }}>{traceOpen ? "▾" : "▸"}</span>
+            </button>
+            {traceOpen && (
+              <div style={{ display: "grid", gap: 10, width: "100%" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 8,
+                      padding: "8px 12px",
+                      borderRadius: 10,
+                      border: "none",
+                      background: "#f3f3f3",
+                      color: "var(--foreground)",
+                      cursor: "pointer",
+                      width: "fit-content",
+                    }}
+                  >
+                    Choose file
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        if (traceUrlRef.current) {
+                          URL.revokeObjectURL(traceUrlRef.current);
+                        }
+                        const url = URL.createObjectURL(file);
+                        traceUrlRef.current = url;
+                        setTraceImageUrl(url);
+                        setTraceFileName(file.name);
+                        setTraceLocked(false);
+                        setTraceOpacity(0.5);
+                      }}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>
+                    {traceFileName ?? "No file chosen"}
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    onClick={fitTraceToGrid}
+                    disabled={!traceImage || traceLocked}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 8,
+                      border: "none",
+                      background: "#f3f3f3",
+                      color: "var(--foreground)",
+                      cursor: "pointer",
+                      opacity: !traceImage || traceLocked ? 0.5 : 1,
+                    }}
+                  >
+                    Fit to grid
+                  </button>
+                  <button
+                    onClick={clearTraceImage}
+                    disabled={!traceImage}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 8,
+                      border: "none",
+                      background: "#f3f3f3",
+                      color: "var(--foreground)",
+                      cursor: "pointer",
+                      opacity: traceImage ? 1 : 0.5,
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  Drag the image to move it. Drag the corners to resize. Lock it when aligned.
+                </div>
+                <div style={{ display: "flex", justifyContent: "center", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ display: "inline-flex", gap: 6 }}>
+                    <button
+                      onClick={() => setTraceLockedState(true)}
+                      disabled={!traceImage}
+                      aria-pressed={traceLocked}
+                      style={{
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: traceLocked ? "1px solid #c26d9a" : "none",
+                        background: traceLocked ? "rgb(255 224 237)" : "#f3f3f3",
+                        color: traceLocked ? "#a84a7b" : "var(--foreground)",
+                        cursor: "pointer",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        opacity: traceImage ? 1 : 0.5,
+                      }}
+                    >
+                      <img
+                        src={assetPath("/lock.svg")}
+                        alt=""
+                        aria-hidden="true"
+                        width={16}
+                        height={16}
+                        style={{
+                          display: "block",
+                          filter: traceLocked ? "none" : "var(--icon-on-bg-filter)",
+                        }}
+                      />
+                      Lock Image
+                    </button>
+                    <button
+                      onClick={() => setTraceLockedState(false)}
+                      disabled={!traceImage}
+                      aria-pressed={!traceLocked}
+                      style={{
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: !traceLocked ? "1px solid #c26d9a" : "none",
+                        background: !traceLocked ? "rgb(255 224 237)" : "#f3f3f3",
+                        color: !traceLocked ? "#a84a7b" : "var(--foreground)",
+                        cursor: "pointer",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        opacity: traceImage ? 1 : 0.5,
+                      }}
+                    >
+                      <img
+                        src={assetPath("/unlock.svg")}
+                        alt=""
+                        aria-hidden="true"
+                        width={16}
+                        height={16}
+                        style={{
+                          display: "block",
+                          filter: !traceLocked ? "none" : "var(--icon-on-bg-filter)",
+                        }}
+                      />
+                      Unlock Image
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div style={cardStyle}>
             <button
               onClick={() => setPaletteOpen((open) => !open)}
               style={{
@@ -1195,33 +1724,107 @@ export default function PatternEditor() {
                 border: "none",
                 background: "transparent",
                 padding: 0,
-                marginBottom: paletteOpen || !isNarrow ? 12 : 0,
-                cursor: isNarrow ? "pointer" : "default",
+                marginBottom: paletteOpen ? 12 : 0,
+                cursor: "pointer",
                 fontWeight: 600,
               }}
               type="button"
             >
               <span>Palette</span>
-              {isNarrow && <span style={{ opacity: 0.7 }}>{paletteOpen ? "▾" : "▸"}</span>}
+              <span style={{ opacity: 0.7 }}>{paletteOpen ? "▾" : "▸"}</span>
             </button>
-            {(!isNarrow || paletteOpen) && (
-              <Palette
-                palette={palette}
-                activeColorId={activeColorId}
-                onSelect={setActiveColorId}
-                remapSourceId={remapSourceId}
-                onRemapSelect={(targetId) => previewRemap(targetId)}
-                onAddColor={addColor}
-              />
+            {paletteOpen && (
+              <div style={{ display: "grid", gap: 10 }}>
+                {traceImage && (
+                  <div
+                    style={{
+                      display: "grid",
+                      gap: 6,
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      background: "rgba(0, 0, 0, 0.04)",
+                    }}
+                  >
+                    <button
+                      onClick={() => setExtractPaletteOpen((open) => !open)}
+                      type="button"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        width: "100%",
+                        border: "none",
+                        background: "transparent",
+                        padding: 0,
+                        cursor: "pointer",
+                        fontWeight: 600,
+                        fontSize: 14,
+                        opacity: 0.85,
+                      }}
+                    >
+                      <span>Generate palette from image</span>
+                      <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
+                        {extractPaletteOpen ? "▾" : "▸"}
+                      </span>
+                    </button>
+                    {extractPaletteOpen && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "nowrap" }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ fontSize: 12, opacity: 0.7 }}>Max colors</span>
+                          <input
+                            type="number"
+                            min={2}
+                            max={32}
+                            step={1}
+                            value={extractPaletteSize}
+                            onChange={(e) => setExtractPaletteSize(Number(e.target.value))}
+                            style={{
+                              width: 72,
+                              padding: "6px 8px",
+                              borderRadius: 8,
+                              border: "1px solid var(--panel-border)",
+                              background: "transparent",
+                              color: "var(--foreground)",
+                            }}
+                          />
+                        </label>
+                        <button
+                          onClick={extractPaletteFromTrace}
+                          disabled={extractingPalette}
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 8,
+                            border: "none",
+                            background: "#f3f3f3",
+                            color: "var(--foreground)",
+                            cursor: "pointer",
+                            opacity: extractingPalette ? 0.5 : 1,
+                          }}
+                        >
+                          {extractingPalette ? "Generating..." : "Generate"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <Palette
+                  palette={palette}
+                  extractedIds={extractedIds}
+                  showExtractedFilter={Boolean(traceImage) && extractedIds.length > 0}
+                  activeColorId={activeColorId}
+                  onSelect={setActiveColorId}
+                  remapSourceId={remapSourceId}
+                  onRemapSelect={(targetId) => previewRemap(targetId)}
+                  onAddColor={addColor}
+                />
+              </div>
             )}
           </div>
 
           {isNarrow && (
             <div
               style={{
-                border: "1px solid var(--panel-border)",
-                borderRadius: 12,
-                padding: 12,
+                ...cardStyle,
                 display: "grid",
                 gap: 12,
               }}
@@ -1242,22 +1845,12 @@ export default function PatternEditor() {
                 type="button"
               >
                 <span>Canvas Settings</span>
-                <span style={{ opacity: 0.7 }}>{canvasSettingsOpen ? "▾" : "▸"}</span>
+                <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
+                  {canvasSettingsOpen ? "▾" : "▸"}
+                </span>
               </button>
               {canvasSettingsOpen && (
                 <>
-                  <label style={{ display: "grid", gap: 6 }}>
-                    <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      value={Math.round(traceOpacity * 100)}
-                      onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
-                      disabled={!traceImage}
-                      style={{ opacity: traceImage ? 1 : 0.4, width: 120 }}
-                    />
-                  </label>
                   <div
                     style={{
                       display: "grid",
@@ -1267,9 +1860,22 @@ export default function PatternEditor() {
                   >
                     <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
                     <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
-                    <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} />
+                    {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
                     <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
                   </div>
+                  {traceImage && (
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        value={Math.round(traceOpacity * 100)}
+                        onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
+                        style={{ width: 120 }}
+                      />
+                    </label>
+                  )}
                 </>
               )}
             </div>
@@ -1281,7 +1887,7 @@ export default function PatternEditor() {
         <div
           style={{
             display: "flex",
-            gap: 16,
+            gap: 24,
             alignItems: "flex-start",
             flex: "1 1 0",
             minWidth: 0,
@@ -1296,8 +1902,6 @@ export default function PatternEditor() {
             style={{
               minWidth: 0,
               flex: "1 1 0",
-              width: "100%",
-              maxWidth: "100%",
             }}
           >
             <CanvasWithExportRef
@@ -1314,7 +1918,7 @@ export default function PatternEditor() {
               containerHeight={containerHeight}
               showGridlines={showGridlines}
               tool={tool}
-              onToolChange={(nextTool: "paint" | "eraser" | "eyedropper" | "lasso") => {
+              onToolChange={(nextTool: "paint" | "eraser" | "fill" | "eyedropper" | "lasso") => {
                 setTool(nextTool);
                 setPanMode(false);
               }}
@@ -1369,11 +1973,10 @@ export default function PatternEditor() {
           {!isNarrow && (
             <div
               style={{
-                border: "1px solid var(--panel-border)",
-                borderRadius: 12,
-                padding: 12,
-                width: "fit-content",
-                minWidth: 140,
+                ...cardStyle,
+                width: 180,
+                minWidth: 180,
+                maxWidth: "100%",
                 flex: "0 0 auto",
                 marginTop: canvasControlsHeight > 0 ? canvasControlsHeight + 10 : 0,
                 display: "grid",
@@ -1400,44 +2003,31 @@ export default function PatternEditor() {
               </button>
               {canvasSettingsOpen && (
                 <>
-                  <label style={{ display: "grid", gap: 6 }}>
-                    <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      value={Math.round(traceOpacity * 100)}
-                      onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
-                      disabled={!traceImage}
-                      style={{ opacity: traceImage ? 1 : 0.4, width: 120 }}
-                    />
-                  </label>
                   <div style={{ display: "grid", gap: 10 }}>
                     <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
                     <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
-                    <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} />
+                    {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
                     <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
                   </div>
+                  {traceImage && (
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        value={Math.round(traceOpacity * 100)}
+                        onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
+                        style={{ width: 120 }}
+                      />
+                    </label>
+                  )}
                 </>
               )}
             </div>
           )}
         </div>
       </div>
-      {isNarrow && (
-        <div style={{ display: "flex", justifyContent: "center", marginTop: -8 }}>
-          <ExportPdfButton
-            title={title}
-            canvasRef={exportCanvasRef}
-            usedColors={usedColors}
-            grid={grid}
-            paletteById={paletteById}
-            width={gridW}
-            height={gridH}
-            cellSize={EXPORT_CELL_SIZE}
-          />
-        </div>
-      )}
     </div>
   );
 }
@@ -1474,6 +2064,8 @@ function CanvasWithExportRef(props: any) {
     onStrokeStart,
     onStrokeEnd,
     onPaintCell,
+    onFillCells,
+    onFillGrid,
     threadView,
     onTogglePanMode,
     traceImage,
@@ -1545,26 +2137,21 @@ function CanvasWithExportRef(props: any) {
   return (
     <div style={{ display: "grid", gap: 10 }}>
       <div ref={controlsRef} style={{ display: "grid", gap: 10 }}>
-        {pinchEnabled && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 12, opacity: 0.7 }}>Tool size</span>
-            <input
-              type="range"
-              min={1}
-              max={12}
-              step={1}
-              value={brushSize}
-              onChange={(e) => onBrushSizeChange(parseInt(e.target.value, 10))}
-            />
-            <span style={{ fontSize: 12, opacity: 0.7 }}>{brushSize}</span>
-          </div>
-        )}
         <div
           className="canvas-toolbar"
-          style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
+          style={{
+            background: "#ffffff",
+            border: "none",
+            borderRadius: 12,
+            padding: 12,
+            boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
         >
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            <span style={{ fontSize: 12, opacity: 0.7 }}>Tool</span>
             <button
               onClick={onTogglePanMode}
               aria-pressed={panMode}
@@ -1572,22 +2159,22 @@ function CanvasWithExportRef(props: any) {
               style={{
                 padding: "8px 10px",
                 borderRadius: 10,
-                border: "1px solid var(--foreground)",
+                border: "none",
                 background: panMode ? "var(--foreground)" : "transparent",
                 color: panMode ? "var(--background)" : "var(--foreground)",
                 cursor: "pointer",
               }}
             >
-              <img
-                src="/pan.svg"
-                alt=""
-                aria-hidden="true"
-                width={18}
+            <img
+              src={assetPath("/pan.svg")}
+              alt=""
+              aria-hidden="true"
+              width={18}
                 height={18}
                 style={{ display: "block", filter: panMode ? "var(--icon-on-fg-filter)" : "var(--icon-on-bg-filter)" }}
               />
             </button>
-          {(["paint", "eraser", "eyedropper", "lasso"] as const).map((t) => (
+          {(["paint", "eraser", "fill", "eyedropper", "lasso"] as const).map((t) => (
             <button
               key={t}
               onClick={() => onToolChange(t)}
@@ -1596,6 +2183,8 @@ function CanvasWithExportRef(props: any) {
                   ? "Brush"
                   : t === "eraser"
                     ? "Eraser"
+                    : t === "fill"
+                      ? "Fill"
                     : t === "eyedropper"
                       ? "Eyedropper"
                       : "Lasso"
@@ -1603,25 +2192,27 @@ function CanvasWithExportRef(props: any) {
               style={{
                 padding: "8px 10px",
                 borderRadius: 10,
-                  border: "1px solid var(--foreground)",
+                  border: "none",
                   background: tool === t && !panMode ? "var(--foreground)" : "transparent",
                   color: tool === t && !panMode ? "var(--background)" : "var(--foreground)",
                   cursor: "pointer",
                 }}
             >
-              <img
-                src={
-                  t === "paint"
-                    ? "/brush.svg"
-                    : t === "eraser"
-                      ? "/eraser.svg"
-                      : t === "eyedropper"
-                        ? "/dropper.svg"
-                        : "/lasso.svg"
-                }
-                alt=""
-                aria-hidden="true"
-                width={18}
+                <img
+                  src={
+                    t === "paint"
+                      ? assetPath("/brush.svg")
+                      : t === "eraser"
+                        ? assetPath("/eraser.svg")
+                        : t === "fill"
+                          ? assetPath("/paint_bucket.svg")
+                        : t === "eyedropper"
+                          ? assetPath("/dropper.svg")
+                          : assetPath("/lasso.svg")
+                  }
+                  alt=""
+                  aria-hidden="true"
+                  width={18}
                 height={18}
                 style={{
                   display: "block",
@@ -1630,6 +2221,7 @@ function CanvasWithExportRef(props: any) {
               />
             </button>
           ))}
+            <span style={{ opacity: 0.45, margin: "0 6px" }}>|</span>
             <button
               onClick={onUndo}
               disabled={!canUndo}
@@ -1637,18 +2229,18 @@ function CanvasWithExportRef(props: any) {
               style={{
                 padding: "8px 10px",
                 borderRadius: 10,
-                border: "1px solid var(--foreground)",
+                border: "none",
                 background: "transparent",
                 color: "var(--foreground)",
                 cursor: "pointer",
                 opacity: canUndo ? 1 : 0.5,
               }}
             >
-              <img
-                src="/undo.svg"
-                alt=""
-                aria-hidden="true"
-                width={18}
+            <img
+              src={assetPath("/undo.svg")}
+              alt=""
+              aria-hidden="true"
+              width={18}
                 height={18}
                 style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
               />
@@ -1660,18 +2252,18 @@ function CanvasWithExportRef(props: any) {
               style={{
                 padding: "8px 10px",
                 borderRadius: 10,
-                border: "1px solid var(--foreground)",
+                border: "none",
                 background: "transparent",
                 color: "var(--foreground)",
                 cursor: "pointer",
                 opacity: canRedo ? 1 : 0.5,
               }}
             >
-              <img
-                src="/redo.svg"
-                alt=""
-                aria-hidden="true"
-                width={18}
+            <img
+              src={assetPath("/redo.svg")}
+              alt=""
+              aria-hidden="true"
+              width={18}
                 height={18}
                 style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
               />
@@ -1682,75 +2274,95 @@ function CanvasWithExportRef(props: any) {
               style={{
                 padding: "8px 10px",
                 borderRadius: 10,
-                border: "1px solid var(--foreground)",
+                border: "none",
                 background: "transparent",
                 color: "var(--foreground)",
                 cursor: "pointer",
               }}
             >
-              <img
-                src="/trash.svg"
-                alt=""
-                aria-hidden="true"
-                width={18}
+            <img
+              src={assetPath("/trash.svg")}
+              alt=""
+              aria-hidden="true"
+              width={18}
                 height={18}
                 style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
               />
             </button>
           </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginLeft: "auto" }}>
+            {!pinchEnabled && (
+              <>
+                <span style={{ fontSize: 12, opacity: 0.7 }}>Tool size</span>
+                <input
+                  type="range"
+                  min={1}
+                  max={12}
+                  step={1}
+                  value={brushSize}
+                  onChange={(e) => onBrushSizeChange(parseInt(e.target.value, 10))}
+                />
+                <span style={{ fontSize: 12, opacity: 0.7 }}>{brushSize}</span>
+              </>
+            )}
+            {pinchEnabled && (
+              <>
+                <span style={{ fontSize: 12, opacity: 0.7 }}>Tool size</span>
+                <input
+                  type="range"
+                  min={1}
+                  max={12}
+                  step={1}
+                  value={brushSize}
+                  onChange={(e) => onBrushSizeChange(parseInt(e.target.value, 10))}
+                />
+                <span style={{ fontSize: 12, opacity: 0.7 }}>{brushSize}</span>
+              </>
+            )}
+          </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          {!pinchEnabled && (
-            <>
-              <span style={{ fontSize: 12, opacity: 0.7 }}>Tool size</span>
-              <input
-                type="range"
-                min={1}
-                max={12}
-                step={1}
-                value={brushSize}
-                onChange={(e) => onBrushSizeChange(parseInt(e.target.value, 10))}
-              />
-              <span style={{ fontSize: 12, opacity: 0.7 }}>{brushSize}</span>
-            </>
-          )}
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              marginLeft: pinchEnabled ? 0 : "auto",
-              gap: 12,
-              flexWrap: "wrap",
-            }}
-          >
-            <label className="zoom-row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+      </div>
+
+      <div
+        style={{
+          background: "#ffffff",
+          border: "none",
+          borderRadius: 12,
+          padding: 12,
+          boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
+          display: "grid",
+          gap: 10,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <label className="zoom-row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <button
                   onClick={() => onZoomChange(Math.max(minZoom, Number((zoom - 0.1).toFixed(2))))}
                   style={{
                     padding: "6px 10px",
                     borderRadius: 8,
-                    border: "1px solid var(--foreground)",
+                    border: "none",
                     background: "transparent",
                     color: "var(--foreground)",
                     cursor: "pointer",
                   }}
                 >
-                  -
-                </button>
-                <input
-                  type="range"
-                  min={Math.round(minZoom * 100)}
-                  max={Math.round(maxZoom * 100)}
-                  value={Math.round(zoom * 100)}
-                  onChange={(e) => onZoomChange(parseInt(e.target.value, 10) / 100)}
-                />
+                -
+              </button>
+              <input
+                type="range"
+                min={Math.round(minZoom * 100)}
+                max={Math.round(maxZoom * 100)}
+                value={Math.round(zoom * 100)}
+                onChange={(e) => onZoomChange(parseInt(e.target.value, 10) / 100)}
+              />
                 <button
                   onClick={() => onZoomChange(Math.min(maxZoom, Number((zoom + 0.1).toFixed(2))))}
                   style={{
                     padding: "6px 10px",
                     borderRadius: 8,
-                    border: "1px solid var(--foreground)",
+                    border: "none",
                     background: "transparent",
                     color: "var(--foreground)",
                     cursor: "pointer",
@@ -1758,71 +2370,84 @@ function CanvasWithExportRef(props: any) {
                 >
                   +
                 </button>
+                <button
+                  onClick={() => onZoomChange(1)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "none",
+                      background: "#f3f3f3",
+                    color: "var(--foreground)",
+                    cursor: "pointer",
+                  }}
+                >
+                  Fit
+                </button>
                 <input
                   type="text"
                   inputMode="numeric"
                   value={zoomInput}
-                  onChange={(e) => {
-                    const next = e.target.value.replace(/[^\d]/g, "");
-                    setZoomInput(next);
-                  }}
-                  onBlur={(e) => commitZoomInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      commitZoomInput((e.target as HTMLInputElement).value);
-                      (e.target as HTMLInputElement).blur();
-                    }
-                  }}
-                  style={{ width: 64, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
-                />
-                <span style={{ fontSize: 12, opacity: 0.7 }}>%</span>
-              </div>
-            </label>
-          </div>
+                onChange={(e) => {
+                  const next = e.target.value.replace(/[^\d]/g, "");
+                  setZoomInput(next);
+                }}
+                onBlur={(e) => commitZoomInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    commitZoomInput((e.target as HTMLInputElement).value);
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                style={{ width: 64, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+              />
+              <span style={{ fontSize: 12, opacity: 0.7 }}>%</span>
+            </div>
+          </label>
         </div>
+        <GridCanvas
+          width={width}
+          height={height}
+          grid={grid}
+          paletteById={paletteById}
+          activeColorId={activeColorId}
+          cellSize={cellSize}
+          containerWidth={containerWidth}
+          containerHeight={containerHeight}
+          showGridlines={showGridlines}
+          tool={tool}
+          brushSize={brushSize}
+          lassoPoints={lassoPoints}
+          lassoClosed={lassoClosed}
+          onPickColor={onPickColor}
+          onPickColorComplete={onPickColorComplete}
+          onLassoReset={onLassoReset}
+          onLassoPoint={onLassoPoint}
+          onLassoClose={onLassoClose}
+          onLassoFill={onLassoFill}
+          onStrokeStart={onStrokeStart}
+          onStrokeEnd={onStrokeEnd}
+          onPaintCell={onPaintCell}
+          onFillCells={onFillCells}
+          onFillGrid={onFillGrid}
+          threadView={threadView}
+          darkCanvas={darkCanvas}
+          panMode={panMode}
+          showSymbols={showSymbols}
+          traceImage={traceImage}
+          traceOpacity={traceOpacity}
+          traceScale={traceScale}
+          traceOffsetX={traceOffsetX}
+          traceOffsetY={traceOffsetY}
+          traceAdjustMode={traceAdjustMode}
+          onTraceOffsetChange={onTraceOffsetChange}
+          onTraceScaleChange={onTraceScaleChange}
+          zoom={zoom}
+          minZoom={minZoom}
+          maxZoom={maxZoom}
+          pinchEnabled={pinchEnabled}
+          onZoomChange={onZoomChange}
+        />
       </div>
-
-      <GridCanvas
-        width={width}
-        height={height}
-        grid={grid}
-        paletteById={paletteById}
-        activeColorId={activeColorId}
-        cellSize={cellSize}
-        containerWidth={containerWidth}
-        containerHeight={containerHeight}
-        showGridlines={showGridlines}
-        tool={tool}
-        brushSize={brushSize}
-        lassoPoints={lassoPoints}
-        lassoClosed={lassoClosed}
-        onPickColor={onPickColor}
-        onPickColorComplete={onPickColorComplete}
-        onLassoReset={onLassoReset}
-        onLassoPoint={onLassoPoint}
-        onLassoClose={onLassoClose}
-        onLassoFill={onLassoFill}
-        onStrokeStart={onStrokeStart}
-        onStrokeEnd={onStrokeEnd}
-        onPaintCell={onPaintCell}
-        threadView={threadView}
-        darkCanvas={darkCanvas}
-        panMode={panMode}
-        showSymbols={showSymbols}
-        traceImage={traceImage}
-        traceOpacity={traceOpacity}
-        traceScale={traceScale}
-        traceOffsetX={traceOffsetX}
-        traceOffsetY={traceOffsetY}
-        traceAdjustMode={traceAdjustMode}
-        onTraceOffsetChange={onTraceOffsetChange}
-        onTraceScaleChange={onTraceScaleChange}
-        zoom={zoom}
-        minZoom={minZoom}
-        maxZoom={maxZoom}
-        pinchEnabled={pinchEnabled}
-        onZoomChange={onZoomChange}
-      />
 
       {/* Hidden high-res canvas for export */}
       <div style={{ position: "absolute", left: -10000, top: -10000 }}>

@@ -35,9 +35,9 @@ export default function ExportPdfButton({
       style={{
         padding: "10px 12px",
         borderRadius: 10,
-        border: "1px solid var(--foreground)",
-        background: "var(--foreground)",
-        color: "var(--background)",
+        border: "none",
+        background: "#e48ab0",
+        color: "#ffffff",
         cursor: "pointer",
       }}
     >
