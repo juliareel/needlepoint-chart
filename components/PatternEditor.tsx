@@ -7,7 +7,7 @@ import ExportPdfButton from "./ExportPdfButton";
 import type { Color } from "../lib/grid";
 import { idx, makeGrid } from "../lib/grid";
 import { DMC_COLORS } from "../lib/dmcColors";
-import { symbolForColorId } from "../lib/symbols";
+import { SYMBOLS, symbolForColorId } from "../lib/symbols";
 import { assetPath } from "../lib/assetPath";
 
 const DEFAULT_PALETTE: Color[] = DMC_COLORS;
@@ -31,6 +31,16 @@ function pointInPolygon(point: Point, polygon: Point[]) {
 }
 
 type LabSamples = { values: Float32Array; count: number };
+
+function contrastForHex(hex: string) {
+  const clean = hex.replace("#", "");
+  if (clean.length !== 6) return "#000000";
+  const r = parseInt(clean.slice(0, 2), 16);
+  const g = parseInt(clean.slice(2, 4), 16);
+  const b = parseInt(clean.slice(4, 6), 16);
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  return luminance > 0.6 ? "#000000" : "#ffffff";
+}
 
 function srgbToLinear(value: number) {
   return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
@@ -395,10 +405,11 @@ export default function PatternEditor() {
   const [darkCanvas, setDarkCanvas] = useState(false);
   const [showSymbols, setShowSymbols] = useState(false);
   const [gridOpen, setGridOpen] = useState(true);
-  const [traceOpen, setTraceOpen] = useState(true);
+  const [traceOpen, setTraceOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const [canvasSettingsOpen, setCanvasSettingsOpen] = useState(true);
   const [usedColorsOpen, setUsedColorsOpen] = useState(true);
+  const [imageToPatternOpen, setImageToPatternOpen] = useState(false);
   const [traceImageUrl, setTraceImageUrl] = useState<string | null>(null);
   const [traceFileName, setTraceFileName] = useState<string | null>(null);
   const [traceImage, setTraceImage] = useState<HTMLImageElement | null>(null);
@@ -415,6 +426,7 @@ export default function PatternEditor() {
   const strokePendingCommitRef = useRef(false);
   const strokeVersionRef = useRef(0);
   const gridRef = useRef<Uint16Array | null>(null);
+  const traceSampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [palette, setPalette] = useState<Color[]>(DEFAULT_PALETTE);
   const [extractedPaletteIds, setExtractedPaletteIds] = useState<number[]>([]);
@@ -428,14 +440,19 @@ export default function PatternEditor() {
   const [extractPaletteSize, setExtractPaletteSize] = useState(12);
   const [extractingPalette, setExtractingPalette] = useState(false);
   const [extractPaletteOpen, setExtractPaletteOpen] = useState(false);
+  const [convertMaxColors, setConvertMaxColors] = useState(20);
+  const [convertSmoothing, setConvertSmoothing] = useState(0.25);
+  const [remapMode, setRemapMode] = useState(false);
   const [remapSourceId, setRemapSourceId] = useState<number | null>(null);
   const [remapTargetId, setRemapTargetId] = useState<number | null>(null);
+  const [identifyMode, setIdentifyMode] = useState(false);
+  const [identifyColorId, setIdentifyColorId] = useState<number | null>(null);
   const draftInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (isNarrow) {
       // setCanvasSettingsOpen(false);
-      setPaletteOpen(false);
+      // setPaletteOpen(false);
     }
   }, [isNarrow]);
   const remapOriginalRef = useRef<Uint16Array | null>(null);
@@ -510,6 +527,7 @@ export default function PatternEditor() {
     };
   }, []);
 
+  const sidebarWidth = 210;
   const canvasCardPadding = 12;
   const canvasInnerWidth = Math.max(1, canvasAreaWidth - canvasCardPadding * 2);
 
@@ -556,6 +574,415 @@ export default function PatternEditor() {
     setTraceScale(scale);
     setTraceOffsetX((baseCanvasW - traceImage.width * scale) / 2);
     setTraceOffsetY((baseCanvasH - traceImage.height * scale) / 2);
+  }
+
+  function convertImageToPattern() {
+    if (!traceImage) return;
+    if (!Number.isFinite(fitCellSize) || fitCellSize <= 0) return;
+    if (!Number.isFinite(traceScale) || traceScale <= 0) return;
+
+    const canvas = traceSampleCanvasRef.current ?? document.createElement("canvas");
+    traceSampleCanvasRef.current = canvas;
+    if (canvas.width !== traceImage.width || canvas.height !== traceImage.height) {
+      canvas.width = traceImage.width;
+      canvas.height = traceImage.height;
+    }
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(traceImage, 0, 0);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+
+    const paletteLabs = palette
+      .map((color) => {
+        const clean = color.hex.replace("#", "");
+        if (clean.length !== 6) return null;
+        const r = parseInt(clean.slice(0, 2), 16) / 255;
+        const g = parseInt(clean.slice(2, 4), 16) / 255;
+        const b = parseInt(clean.slice(4, 6), 16) / 255;
+        if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+        const lab = rgbToOklab(r, g, b);
+        return { id: color.id, L: lab.L, A: lab.A, B: lab.B };
+      })
+      .filter((entry): entry is { id: number; L: number; A: number; B: number } => Boolean(entry));
+    if (paletteLabs.length === 0) return;
+
+    let allowedPalette = paletteLabs;
+    const maxColors = Math.max(2, Math.min(convertMaxColors, paletteLabs.length));
+    if (maxColors < paletteLabs.length) {
+      const hexes = extractPaletteFromImage(traceImage, maxColors);
+      const picked: number[] = [];
+      const seen = new Set<number>();
+      for (const hex of hexes) {
+        const clean = hex.replace("#", "");
+        if (clean.length !== 6) continue;
+        const r = parseInt(clean.slice(0, 2), 16) / 255;
+        const g = parseInt(clean.slice(2, 4), 16) / 255;
+        const b = parseInt(clean.slice(4, 6), 16) / 255;
+        if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) continue;
+        const lab = rgbToOklab(r, g, b);
+        let bestId: number | null = null;
+        let bestDist = Number.POSITIVE_INFINITY;
+        for (const candidate of paletteLabs) {
+          if (seen.has(candidate.id)) continue;
+          const dx = lab.L - candidate.L;
+          const dy = lab.A - candidate.A;
+          const dz = lab.B - candidate.B;
+          const dist = dx * dx + dy * dy + dz * dz;
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestId = candidate.id;
+          }
+        }
+        if (bestId == null) continue;
+        seen.add(bestId);
+        picked.push(bestId);
+      }
+      if (picked.length > 0) {
+        const allowed = new Set(picked);
+        const subset = paletteLabs.filter((entry) => allowed.has(entry.id));
+        if (subset.length > 0) {
+          allowedPalette = subset;
+        }
+      }
+    }
+
+    const imgW = canvas.width;
+    const imgH = canvas.height;
+    const cellCount = gridW * gridH;
+    const rawR = new Float32Array(cellCount);
+    const rawG = new Float32Array(cellCount);
+    const rawB = new Float32Array(cellCount);
+    const rawLabL = new Float32Array(cellCount);
+    const rawLabA = new Float32Array(cellCount);
+    const rawLabB = new Float32Array(cellCount);
+    const mask = new Uint8Array(cellCount);
+
+    for (let y = 0; y < gridH; y++) {
+      const centerY = (y + 0.5) * fitCellSize;
+      const imgY = (centerY - traceOffsetY) / traceScale;
+      if (imgY < 0 || imgY >= imgH) continue;
+      const iy = Math.floor(imgY);
+      const rowOffset = iy * imgW * 4;
+      for (let x = 0; x < gridW; x++) {
+        const centerX = (x + 0.5) * fitCellSize;
+        const imgX = (centerX - traceOffsetX) / traceScale;
+        if (imgX < 0 || imgX >= imgW) continue;
+        const ix = Math.floor(imgX);
+        const idx4 = rowOffset + ix * 4;
+        const alpha = data[idx4 + 3];
+        if (alpha < 10) continue;
+        const r = data[idx4] / 255;
+        const g = data[idx4 + 1] / 255;
+        const b = data[idx4 + 2] / 255;
+        const lab = rgbToOklab(r, g, b);
+        const cellIdx = idx(x, y, gridW);
+        mask[cellIdx] = 1;
+        rawR[cellIdx] = r;
+        rawG[cellIdx] = g;
+        rawB[cellIdx] = b;
+        rawLabL[cellIdx] = lab.L;
+        rawLabA[cellIdx] = lab.A;
+        rawLabB[cellIdx] = lab.B;
+      }
+    }
+
+    const smoothStrength = clamp01(convertSmoothing);
+    const radius = smoothStrength > 0.66 ? 2 : 1;
+    const spatialSigma = radius === 2 ? 1.6 : 1;
+    const rangeSigma = 0.04 + 0.12 * smoothStrength;
+    const rangeSigma2 = 2 * rangeSigma * rangeSigma;
+    const offsets: { dx: number; dy: number; w: number }[] = [];
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const dist2 = dx * dx + dy * dy;
+        const w = Math.exp(-dist2 / (2 * spatialSigma * spatialSigma));
+        offsets.push({ dx, dy, w });
+      }
+    }
+
+    const smoothR = new Float32Array(cellCount);
+    const smoothG = new Float32Array(cellCount);
+    const smoothB = new Float32Array(cellCount);
+    const smoothLabL = new Float32Array(cellCount);
+    const smoothLabA = new Float32Array(cellCount);
+    const smoothLabB = new Float32Array(cellCount);
+
+    if (smoothStrength > 0.01) {
+      for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+          const cellIdx = idx(x, y, gridW);
+          if (mask[cellIdx] === 0) continue;
+          const baseL = rawLabL[cellIdx];
+          const baseA = rawLabA[cellIdx];
+          const baseB = rawLabB[cellIdx];
+          let sumR = 0;
+          let sumG = 0;
+          let sumB = 0;
+          let sumW = 0;
+          for (const offset of offsets) {
+            const nx = x + offset.dx;
+            const ny = y + offset.dy;
+            if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) continue;
+            const nIdx = idx(nx, ny, gridW);
+            if (mask[nIdx] === 0) continue;
+            const dL = rawLabL[nIdx] - baseL;
+            const dA = rawLabA[nIdx] - baseA;
+            const dB = rawLabB[nIdx] - baseB;
+            const dist = dL * dL + dA * dA + dB * dB;
+            const rangeW = Math.exp(-dist / rangeSigma2);
+            const weight = offset.w * rangeW;
+            sumR += rawR[nIdx] * weight;
+            sumG += rawG[nIdx] * weight;
+            sumB += rawB[nIdx] * weight;
+            sumW += weight;
+          }
+          const r = sumW > 0 ? sumR / sumW : rawR[cellIdx];
+          const g = sumW > 0 ? sumG / sumW : rawG[cellIdx];
+          const b = sumW > 0 ? sumB / sumW : rawB[cellIdx];
+          smoothR[cellIdx] = r;
+          smoothG[cellIdx] = g;
+          smoothB[cellIdx] = b;
+          const lab = rgbToOklab(r, g, b);
+          smoothLabL[cellIdx] = lab.L;
+          smoothLabA[cellIdx] = lab.A;
+          smoothLabB[cellIdx] = lab.B;
+        }
+      }
+    } else {
+      smoothR.set(rawR);
+      smoothG.set(rawG);
+      smoothB.set(rawB);
+      smoothLabL.set(rawLabL);
+      smoothLabA.set(rawLabA);
+      smoothLabB.set(rawLabB);
+    }
+
+    const quantized = new Uint16Array(cellCount);
+    for (let y = 0; y < gridH; y++) {
+      for (let x = 0; x < gridW; x++) {
+        const cellIdx = idx(x, y, gridW);
+        if (mask[cellIdx] === 0) continue;
+        const labL = smoothLabL[cellIdx];
+        const labA = smoothLabA[cellIdx];
+        const labB = smoothLabB[cellIdx];
+        let bestId = allowedPalette[0].id;
+        let bestDist = Number.POSITIVE_INFINITY;
+        for (const candidate of allowedPalette) {
+          const dx = labL - candidate.L;
+          const dy = labA - candidate.A;
+          const dz = labB - candidate.B;
+          const dist = dx * dx + dy * dy + dz * dz;
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestId = candidate.id;
+          }
+        }
+        quantized[cellIdx] = bestId;
+      }
+    }
+
+    const edgeStrength = new Float32Array(cellCount);
+    for (let y = 0; y < gridH; y++) {
+      for (let x = 0; x < gridW; x++) {
+        const cellIdx = idx(x, y, gridW);
+        if (mask[cellIdx] === 0) continue;
+        const l0 = smoothLabL[cellIdx];
+        const a0 = smoothLabA[cellIdx];
+        const b0 = smoothLabB[cellIdx];
+        let maxDist = 0;
+        if (x > 0) {
+          const nIdx = cellIdx - 1;
+          if (mask[nIdx]) {
+            const dl = l0 - smoothLabL[nIdx];
+            const da = a0 - smoothLabA[nIdx];
+            const db = b0 - smoothLabB[nIdx];
+            const dist = dl * dl + da * da + db * db;
+            if (dist > maxDist) maxDist = dist;
+          }
+        }
+        if (x < gridW - 1) {
+          const nIdx = cellIdx + 1;
+          if (mask[nIdx]) {
+            const dl = l0 - smoothLabL[nIdx];
+            const da = a0 - smoothLabA[nIdx];
+            const db = b0 - smoothLabB[nIdx];
+            const dist = dl * dl + da * da + db * db;
+            if (dist > maxDist) maxDist = dist;
+          }
+        }
+        if (y > 0) {
+          const nIdx = cellIdx - gridW;
+          if (mask[nIdx]) {
+            const dl = l0 - smoothLabL[nIdx];
+            const da = a0 - smoothLabA[nIdx];
+            const db = b0 - smoothLabB[nIdx];
+            const dist = dl * dl + da * da + db * db;
+            if (dist > maxDist) maxDist = dist;
+          }
+        }
+        if (y < gridH - 1) {
+          const nIdx = cellIdx + gridW;
+          if (mask[nIdx]) {
+            const dl = l0 - smoothLabL[nIdx];
+            const da = a0 - smoothLabA[nIdx];
+            const db = b0 - smoothLabB[nIdx];
+            const dist = dl * dl + da * da + db * db;
+            if (dist > maxDist) maxDist = dist;
+          }
+        }
+        edgeStrength[cellIdx] = maxDist;
+      }
+    }
+
+    let cleaned = quantized;
+    const visited = new Uint8Array(cellCount);
+    const stack = new Int32Array(cellCount);
+    const minBlobSize = Math.max(2, Math.round(2 + smoothStrength * 6));
+    const edgeThreshold = 0.1 + (1 - smoothStrength) * 0.08;
+    const edgeThresholdSq = edgeThreshold * edgeThreshold;
+
+    for (let i = 0; i < cellCount; i++) {
+      const colorId = cleaned[i];
+      if (colorId === 0 || visited[i]) continue;
+      let sp = 0;
+      stack[sp++] = i;
+      visited[i] = 1;
+      let size = 0;
+      let maxEdge = 0;
+      const compIndices: number[] = [];
+      const neighborCounts = new Map<number, number>();
+
+      while (sp > 0) {
+        const idxCell = stack[--sp];
+        size += 1;
+        if (size <= minBlobSize) compIndices.push(idxCell);
+        if (edgeStrength[idxCell] > maxEdge) maxEdge = edgeStrength[idxCell];
+        const x = idxCell % gridW;
+        const y = Math.floor(idxCell / gridW);
+
+        const checkNeighbor = (nx: number, ny: number) => {
+          if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) return;
+          const nIdx = idx(nx, ny, gridW);
+        const nId = cleaned[nIdx];
+        if (nId === colorId) {
+          if (!visited[nIdx]) {
+            visited[nIdx] = 1;
+            stack[sp++] = nIdx;
+            }
+          } else {
+            neighborCounts.set(nId, (neighborCounts.get(nId) ?? 0) + 1);
+          }
+        };
+
+        checkNeighbor(x - 1, y);
+        checkNeighbor(x + 1, y);
+        checkNeighbor(x, y - 1);
+        checkNeighbor(x, y + 1);
+      }
+
+      if (size <= minBlobSize && maxEdge < edgeThresholdSq) {
+        let replaceId = colorId;
+        let bestCount = -1;
+        for (const [id, count] of neighborCounts) {
+          if (count > bestCount) {
+            bestCount = count;
+            replaceId = id;
+          }
+        }
+        if (bestCount >= 0 && replaceId !== colorId) {
+          for (const cellIdx of compIndices) {
+            cleaned[cellIdx] = replaceId;
+          }
+        }
+      }
+    }
+
+    const majorityPasses = smoothStrength > 0.7 ? 2 : 1;
+    for (let pass = 0; pass < majorityPasses; pass++) {
+      const updated = new Uint16Array(cleaned);
+      for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+          const cellIdx = idx(x, y, gridW);
+          if (mask[cellIdx] === 0) continue;
+          if (edgeStrength[cellIdx] >= edgeThresholdSq) continue;
+          const currentId = cleaned[cellIdx];
+          const counts = new Map<number, number>();
+          const check = (nx: number, ny: number) => {
+            if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) return;
+            const nIdx = idx(nx, ny, gridW);
+            if (mask[nIdx] === 0) return;
+            const nId = cleaned[nIdx];
+            if (nId === 0) return;
+            counts.set(nId, (counts.get(nId) ?? 0) + 1);
+          };
+          check(x - 1, y);
+          check(x + 1, y);
+          check(x, y - 1);
+          check(x, y + 1);
+          check(x - 1, y - 1);
+          check(x + 1, y - 1);
+          check(x - 1, y + 1);
+          check(x + 1, y + 1);
+          let bestId = currentId;
+          let bestCount = 0;
+          for (const [id, count] of counts) {
+            if (count > bestCount) {
+              bestCount = count;
+              bestId = id;
+            }
+          }
+          if (bestId !== currentId && bestCount >= 5) {
+            updated[cellIdx] = bestId;
+          }
+        }
+      }
+      cleaned = updated;
+    }
+
+    if (smoothStrength > 0.75) {
+      const updated = new Uint16Array(cleaned);
+      for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+          const cellIdx = idx(x, y, gridW);
+          if (mask[cellIdx] === 0) continue;
+          if (edgeStrength[cellIdx] >= edgeThresholdSq) continue;
+          const currentId = cleaned[cellIdx];
+          const counts = new Map<number, number>();
+          const check = (nx: number, ny: number) => {
+            if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) return;
+            const nIdx = idx(nx, ny, gridW);
+            if (mask[nIdx] === 0) return;
+            const nId = cleaned[nIdx];
+            if (nId === 0) return;
+            counts.set(nId, (counts.get(nId) ?? 0) + 1);
+          };
+          check(x - 1, y);
+          check(x + 1, y);
+          check(x, y - 1);
+          check(x, y + 1);
+          check(x - 1, y - 1);
+          check(x + 1, y - 1);
+          check(x - 1, y + 1);
+          check(x + 1, y + 1);
+          let bestId = currentId;
+          let bestCount = 0;
+          for (const [id, count] of counts) {
+            if (count > bestCount) {
+              bestCount = count;
+              bestId = id;
+            }
+          }
+          if (bestId !== currentId && bestCount >= 5) {
+            updated[cellIdx] = bestId;
+          }
+        }
+      }
+      cleaned = updated;
+    }
+
+    updateGrid(() => cleaned);
   }
 
   function clearTraceImage() {
@@ -943,13 +1370,16 @@ export default function PatternEditor() {
     setActiveColorId(picked[0]);
   }
 
+  const cardShadow = "0 6px 16px rgba(15, 23, 42, 0.12)";
+  const cardShadowCollapsed = "0 3px 10px rgba(15, 23, 42, 0.08)";
   const cardStyle = {
-    background: "#ffffff",
+    background: "var(--card-bg)",
     border: "none",
     borderRadius: 12,
     padding: 12,
-    boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
+    boxShadow: cardShadow,
   } as const;
+  const canvasSettingsMaxHeight = traceImage ? 1200 : 800;
 
   function replaceColor(sourceId: number, targetId: number) {
     if (sourceId === targetId) {
@@ -1003,6 +1433,33 @@ export default function PatternEditor() {
     setRemapTargetId(null);
   }
 
+  function toggleRemapMode() {
+    if (remapMode) {
+      cancelRemap();
+      setRemapMode(false);
+      return;
+    }
+    if (identifyMode) {
+      setIdentifyMode(false);
+      setIdentifyColorId(null);
+    }
+    cancelRemap();
+    setRemapMode(true);
+  }
+
+  function toggleIdentifyMode() {
+    if (identifyMode) {
+      setIdentifyMode(false);
+      setIdentifyColorId(null);
+      return;
+    }
+    if (remapMode) {
+      cancelRemap();
+      setRemapMode(false);
+    }
+    setIdentifyMode(true);
+  }
+
   function confirmRemap() {
     if (remapSourceId === null || remapTargetId === null) {
       cancelRemap();
@@ -1023,12 +1480,15 @@ export default function PatternEditor() {
     remapOriginalRef.current = null;
     setRemapSourceId(null);
     setRemapTargetId(null);
+    setRemapMode(false);
   }
 
   const usedColors = useMemo(() => {
+    const sourceGrid =
+      remapMode && remapSourceId !== null && remapOriginalRef.current ? remapOriginalRef.current : grid;
     const counts = new Map<number, number>();
-    for (let i = 0; i < grid.length; i++) {
-      const id = grid[i];
+    for (let i = 0; i < sourceGrid.length; i++) {
+      const id = sourceGrid[i];
       if (id === 0) continue;
       counts.set(id, (counts.get(id) || 0) + 1);
     }
@@ -1037,7 +1497,16 @@ export default function PatternEditor() {
       .filter((x) => Boolean(x.color))
       .sort((a, b) => b.count - a.count);
     return arr;
-  }, [grid, paletteById]);
+  }, [grid, paletteById, remapMode, remapSourceId]);
+  const usedColorIds = useMemo(() => usedColors.map((entry) => entry.color.id), [usedColors]);
+  const symbolMap = useMemo(() => {
+    const map = new Map<number, string>();
+    usedColors.forEach((entry, index) => {
+      const symbol = SYMBOLS[index % SYMBOLS.length] ?? "";
+      if (symbol) map.set(entry.color.id, symbol);
+    });
+    return map;
+  }, [usedColors]);
 
   async function buildTraceImageDataUrl() {
     if (!traceImage) return null;
@@ -1216,8 +1685,134 @@ export default function PatternEditor() {
     );
   }
 
+  const collapseStyle = (open: boolean, maxHeight = 1200) =>
+    ({
+      minHeight: 0,
+      maxHeight: open ? maxHeight : 0,
+      opacity: open ? 1 : 0,
+      transform: open ? "translateY(0)" : "translateY(-4px)",
+      overflow: open ? "visible" : "hidden",
+      transition: "max-height 220ms ease, opacity 180ms ease, transform 180ms ease",
+      pointerEvents: open ? "auto" : "none",
+    }) as const;
+
+  const paletteSection = (
+    <div
+      className="app-card"
+      style={{ ...cardStyle, boxShadow: paletteOpen ? cardShadow : cardShadowCollapsed }}
+    >
+      <button
+        onClick={() => setPaletteOpen((open) => !open)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+          border: "none",
+          background: "transparent",
+          padding: 0,
+          marginBottom: paletteOpen ? 12 : 0,
+          cursor: "pointer",
+          fontWeight: 600,
+        }}
+        type="button"
+      >
+        <span>Palette</span>
+        <span style={{ opacity: 0.7 }}>{paletteOpen ? "▾" : "▸"}</span>
+      </button>
+      <div style={{ display: "grid", gap: 10, ...collapseStyle(paletteOpen, 1600) }}>
+          {traceImage && (
+            <div
+              style={{
+                display: "grid",
+                gap: extractPaletteOpen ? 6 : 0,
+                padding: extractPaletteOpen ? "10px 12px" : "6px 10px",
+                borderRadius: 10,
+                background: "var(--accent-wash)",
+              }}
+            >
+              <button
+                onClick={() => setExtractPaletteOpen((open) => !open)}
+                type="button"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  width: "100%",
+                  border: "none",
+                  background: "transparent",
+                  padding: 0,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                  fontSize: 14,
+                  opacity: 0.85,
+                }}
+              >
+                <span>Generate from image</span>
+                <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
+                  {extractPaletteOpen ? "▾" : "▸"}
+                </span>
+              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", ...collapseStyle(extractPaletteOpen, 120) }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 12, opacity: 0.7 }}>Max colors</span>
+                    <input
+                      type="number"
+                      min={2}
+                      max={32}
+                      step={1}
+                      value={extractPaletteSize}
+                      onChange={(e) => setExtractPaletteSize(Number(e.target.value))}
+                      style={{
+                        width: 72,
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        border: "1px solid var(--panel-border)",
+                        background: "transparent",
+                        color: "var(--foreground)",
+                      }}
+                    />
+                  </label>
+                        <button
+                          onClick={extractPaletteFromTrace}
+                          disabled={extractingPalette}
+                          style={{
+                            padding: "4px 10px",
+                            borderRadius: 8,
+                            border: "none",
+                            background: "var(--accent)",
+                            color: "#ffffff",
+                            cursor: "pointer",
+                            opacity: extractingPalette ? 0.5 : 1,
+                          }}
+                        >
+                    {extractingPalette ? "Generating..." : "Generate"}
+                  </button>
+                </div>
+            </div>
+          )}
+          <Palette
+            palette={palette}
+            extractedIds={extractedIds}
+            showExtractedFilter={Boolean(traceImage) && extractedIds.length > 0}
+            usedIds={usedColorIds}
+            showUsedFilter={usedColorIds.length > 0}
+            activeColorId={remapTargetId ?? activeColorId}
+            onSelect={setActiveColorId}
+            remapSourceId={remapSourceId}
+            remapTargetId={remapTargetId}
+            onRemapSelect={(targetId) => previewRemap(targetId)}
+            onAddColor={addColor}
+          />
+      </div>
+    </div>
+  );
+
   const usedColorsSection = (
-    <div style={cardStyle}>
+    <div
+      className="app-card"
+      style={{ ...cardStyle, boxShadow: usedColorsOpen ? cardShadow : cardShadowCollapsed }}
+    >
       <button
         onClick={() => setUsedColorsOpen((open) => !open)}
         style={{
@@ -1234,91 +1829,181 @@ export default function PatternEditor() {
         }}
         type="button"
       >
-        <span>Used colors</span>
+        <span>Used colors ({usedColors.length})</span>
         <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
           {usedColorsOpen ? "▾" : "▸"}
         </span>
       </button>
-      {usedColorsOpen && (
-        <>
-          <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>
-            Click a color to replace it.
+      <div style={{ ...collapseStyle(usedColorsOpen, 800) }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 6 }}>
+            <button
+              onClick={toggleRemapMode}
+              aria-pressed={remapMode}
+              style={{
+                padding: "4px 10px",
+                borderRadius: 999,
+                border: remapMode ? "1px solid var(--accent-strong)" : "none",
+                background: remapMode ? "var(--accent-soft)" : "var(--muted-bg)",
+                color: remapMode ? "var(--accent-strong)" : "var(--foreground)",
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+            >
+              Swap colors
+            </button>
+            <button
+              onClick={toggleIdentifyMode}
+              aria-pressed={identifyMode}
+              style={{
+                padding: "4px 10px",
+                borderRadius: 999,
+                border: identifyMode ? "1px solid var(--accent-strong)" : "none",
+                background: identifyMode ? "var(--accent-soft)" : "var(--muted-bg)",
+                color: identifyMode ? "var(--accent-strong)" : "var(--foreground)",
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+            >
+              Identify
+            </button>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              {remapMode
+                ? remapSourceId !== null
+                  ? "Pick replacement color."
+                  : "Select a used color to replace."
+                : identifyMode
+                  ? "Select a used color to highlight."
+                : ""}
+            </div>
           </div>
-          {remapSourceId !== null && (
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-              Pick a replacement color from the palette, then press OK to apply.
+          {remapMode && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
               <button
-                onClick={cancelRemap}
+                onClick={() => {
+                  cancelRemap();
+                  setRemapMode(false);
+                }}
                 style={{
-                  marginLeft: 8,
                   padding: "2px 8px",
                   borderRadius: 999,
                   border: "none",
-                  background: "#f3f3f3",
+                  background: "var(--muted-bg)",
                   color: "var(--foreground)",
                   cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: 600,
                 }}
               >
                 Cancel
               </button>
               <button
                 onClick={confirmRemap}
+                disabled={remapSourceId === null || remapTargetId === null}
                 style={{
-                  marginLeft: 8,
                   padding: "2px 8px",
                   borderRadius: 999,
                   border: "1px solid var(--foreground)",
                   background: "var(--foreground)",
                   color: "var(--background)",
-                  cursor: "pointer",
+                  cursor: remapSourceId === null || remapTargetId === null ? "not-allowed" : "pointer",
+                  opacity: remapSourceId === null || remapTargetId === null ? 0.5 : 1,
+                  fontSize: 11,
+                  fontWeight: 600,
                 }}
               >
                 OK
               </button>
             </div>
           )}
-          <div style={{ display: "grid", gap: 6 }}>
+          <div style={{ display: "grid", gap: 6, maxHeight: 240, overflowY: "auto", paddingRight: 4 }}>
             {usedColors.length === 0 ? (
               <div style={{ opacity: 0.7 }}>None yet.</div>
             ) : (
-              usedColors.slice(0, 12).map(({ color, count }) => (
-                <button
-                  key={color.id}
-                  onClick={() => beginRemap(color.id)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    padding: "4px 6px",
-                    borderRadius: 8,
-                    border:
-                      remapSourceId === color.id ? "2px solid var(--foreground)" : "1px solid transparent",
-                    background: "transparent",
-                    cursor: "pointer",
-                    textAlign: "left",
-                  }}
-                  aria-label={`Replace ${color.name}`}
-                >
-                  <span
-                    style={{
-                      width: 14,
-                      height: 14,
-                      borderRadius: 4,
-                      border: "1px solid rgba(0,0,0,0.2)",
-                      background: color.hex,
-                      display: "inline-block",
+              usedColors.map(({ color, count }) => {
+                const isIdentifyActive = identifyColorId === color.id;
+                return (
+                  <button
+                    key={color.id}
+                    onClick={() => {
+                      if (remapMode) {
+                        beginRemap(color.id);
+                        return;
+                      }
+                      if (identifyMode) {
+                        setIdentifyColorId((prev) => (prev === color.id ? null : color.id));
+                        return;
+                      }
+                      setActiveColorId(color.id);
                     }}
-                  />
-                  <span style={{ fontSize: 13 }}>
-                    {color.code ? `#${color.code} ` : ""}
-                    {color.name} ({count})
-                  </span>
-                </button>
-              ))
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "4px 6px",
+                      borderRadius: 8,
+                      border:
+                        remapSourceId === color.id
+                          ? "2px solid var(--foreground)"
+                          : isIdentifyActive
+                            ? "2px solid var(--accent-strong)"
+                            : "1px solid transparent",
+                      background: "transparent",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      minWidth: 0,
+                    }}
+                    aria-label={`Select ${color.name}`}
+                  >
+                    <span
+                      style={{
+                        width: 26,
+                        height: 26,
+                        borderRadius: 5,
+                        background: color.hex,
+                        display: "block",
+                        flexShrink: 0,
+                        boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.15)",
+                        position: "relative",
+                      }}
+                    >
+                      {showSymbols && symbolForColorId(color.id, symbolMap) && (
+                        <span
+                          style={{
+                            position: "absolute",
+                            inset: 0,
+                            display: "grid",
+                            placeItems: "center",
+                            fontSize: 9,
+                            color: contrastForHex(color.hex),
+                            opacity: 0.85,
+                            pointerEvents: "none",
+                          }}
+                        >
+                          {symbolForColorId(color.id, symbolMap)}
+                        </span>
+                      )}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        lineHeight: 1.2,
+                        whiteSpace: "normal",
+                        wordBreak: "break-word",
+                        flex: "1 1 auto",
+                        minWidth: 0,
+                      }}
+                    >
+                      {color.code ? `#${color.code} ` : ""}
+                      {color.name} ({count})
+                    </span>
+                  </button>
+                );
+              })
             )}
           </div>
-        </>
-      )}
+      </div>
     </div>
   );
 
@@ -1330,12 +2015,13 @@ export default function PatternEditor() {
       <div
         className="pattern-main"
         style={{
-          display: "flex",
-          gap: 24,
-          alignItems: "flex-start",
-          flexDirection: isNarrow ? "column" : "row",
+          display: "grid",
+          columnGap: 12,
+          rowGap: 24,
+          alignItems: "start",
           width: "100%",
           minWidth: 0,
+          gridTemplateColumns: isNarrow ? "1fr" : `${sidebarWidth}px minmax(0, 1fr) ${sidebarWidth}px`,
         }}
       >
         <div
@@ -1344,29 +2030,52 @@ export default function PatternEditor() {
             display: "grid",
             gap: 16,
             alignContent: "start",
-            flex: isNarrow ? "1 1 auto" : "0 0 280px",
-            width: isNarrow ? "100%" : undefined,
+            width: "100%",
+            minWidth: 0,
           }}
         >
-          <div style={{ ...cardStyle, display: "grid", gap: 8 }}>
+          <div style={{ display: "flex", justifyContent: "center" }}>
+            <img
+              src={assetPath("/wippa_logo.png")}
+              alt="Wippa"
+              style={{ height: 92, width: "auto", display: "block" }}
+            />
+          </div>
+          <div
+            className="app-card"
+            style={{
+              ...cardStyle,
+              display: "grid",
+              gap: 8,
+              justifyItems: "center",
+              textAlign: "center",
+            }}
+          >
             <input
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--panel-border)" }}
+              style={{
+                padding: "8px 10px",
+                borderRadius: 8,
+                border: "1px solid var(--panel-border)",
+                width: "100%",
+              }}
             />
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ display: "grid", gap: 8, width: "100%" }}>
               <button
                 onClick={saveDraft}
                 style={{
                   padding: "6px 10px",
                   borderRadius: 8,
                   border: "none",
-                      background: "#f3f3f3",
+                  background: "var(--muted-bg)",
                   color: "var(--foreground)",
                   cursor: "pointer",
+                  fontSize: 14,
+                  width: "100%",
                 }}
               >
-                Save draft
+                Save WIP
               </button>
               <button
                 onClick={() => draftInputRef.current?.click()}
@@ -1374,12 +2083,14 @@ export default function PatternEditor() {
                   padding: "6px 10px",
                   borderRadius: 8,
                   border: "none",
-                      background: "#f3f3f3",
+                  background: "var(--muted-bg)",
                   color: "var(--foreground)",
                   cursor: "pointer",
+                  fontSize: 14,
+                  width: "100%",
                 }}
               >
-                Load draft
+                Load WIP
               </button>
               <input
                 ref={draftInputRef}
@@ -1394,13 +2105,14 @@ export default function PatternEditor() {
                 style={{ display: "none" }}
               />
             </div>
-            <div style={{ display: "flex", justifyContent: "center" }}>
+            <div style={{ display: "flex", justifyContent: "center", width: "100%" }}>
               <ExportPdfButton
                 title={title}
                 canvasRef={exportCanvasRef}
                 usedColors={usedColors}
                 grid={grid}
                 paletteById={paletteById}
+                symbolMap={symbolMap}
                 width={gridW}
                 height={gridH}
                 cellSize={EXPORT_CELL_SIZE}
@@ -1408,8 +2120,10 @@ export default function PatternEditor() {
             </div>
           </div>
           <div
+            className="app-card"
             style={{
               ...cardStyle,
+              boxShadow: gridOpen ? cardShadow : cardShadowCollapsed,
               width: "100%",
               minHeight: gridOpen ? 240 : 0,
               boxSizing: "border-box",
@@ -1435,20 +2149,21 @@ export default function PatternEditor() {
               <span style={{ opacity: 0.7 }}>{gridOpen ? "▾" : "▸"}</span>
             </button>
 
-            {gridOpen && (
-              <div style={{ display: "grid", gap: 8, width: "100%" }}>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ display: "grid", gap: 8, width: "100%", ...collapseStyle(gridOpen, 900) }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "nowrap" }}>
                   <button
                     type="button"
                     onClick={() => setDraftGridMode("stitches")}
                     aria-pressed={draftGridMode === "stitches"}
                     style={{
-                      padding: "6px 10px",
+                      padding: "5px 9px",
                       borderRadius: 10,
-                      border: draftGridMode === "stitches" ? "1px solid #c26d9a" : "none",
-                      background: draftGridMode === "stitches" ? "rgb(255 224 237)" : "#f3f3f3",
-                      color: draftGridMode === "stitches" ? "#a84a7b" : "var(--foreground)",
+                      border: draftGridMode === "stitches" ? "1px solid var(--accent-strong)" : "none",
+                      background: draftGridMode === "stitches" ? "var(--accent-wash)" : "var(--muted-bg)",
+                      color: draftGridMode === "stitches" ? "var(--accent-strong)" : "var(--foreground)",
                       cursor: "pointer",
+                      fontSize: 13.5,
+                      flex: "1 1 0",
                     }}
                   >
                     Stitch Count
@@ -1458,12 +2173,14 @@ export default function PatternEditor() {
                     onClick={() => setDraftGridMode("inches")}
                     aria-pressed={draftGridMode === "inches"}
                     style={{
-                      padding: "6px 10px",
+                      padding: "5px 9px",
                       borderRadius: 10,
-                      border: draftGridMode === "inches" ? "1px solid #c26d9a" : "none",
-                      background: draftGridMode === "inches" ? "rgb(255 224 237)" : "#f3f3f3",
-                      color: draftGridMode === "inches" ? "#a84a7b" : "var(--foreground)",
+                      border: draftGridMode === "inches" ? "1px solid var(--accent-strong)" : "none",
+                      background: draftGridMode === "inches" ? "var(--accent-wash)" : "var(--muted-bg)",
+                      color: draftGridMode === "inches" ? "var(--accent-strong)" : "var(--foreground)",
                       cursor: "pointer",
+                      fontSize: 13.5,
+                      flex: "1 1 0",
                     }}
                   >
                     Dimensions
@@ -1479,7 +2196,7 @@ export default function PatternEditor() {
                       min={1}
                       value={draftGridW}
                       onChange={(e) => setDraftGridW(parseInt(e.target.value || "1", 10))}
-                      style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -1489,7 +2206,7 @@ export default function PatternEditor() {
                       min={1}
                       value={draftGridH}
                       onChange={(e) => setDraftGridH(parseInt(e.target.value || "1", 10))}
-                      style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
                   </>
@@ -1503,7 +2220,7 @@ export default function PatternEditor() {
                       step={0.1}
                       value={draftWidthIn}
                       onChange={(e) => setDraftWidthIn(parseFloat(e.target.value || "0"))}
-                      style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -1514,7 +2231,7 @@ export default function PatternEditor() {
                       step={0.1}
                       value={draftHeightIn}
                       onChange={(e) => setDraftHeightIn(parseFloat(e.target.value || "0"))}
-                      style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -1524,7 +2241,7 @@ export default function PatternEditor() {
                       min={1}
                       value={draftMeshCount}
                       onChange={(e) => setDraftMeshCount(parseInt(e.target.value || "1", 10))}
-                      style={{ width: 110, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
                     />
                     </label>
                   </>
@@ -1536,19 +2253,21 @@ export default function PatternEditor() {
                       padding: "8px 12px",
                       borderRadius: 10,
                       border: "none",
-                      background: "#e48ab0",
-                      color: "#ffffff",
+                      background: "var(--accent)",
+                      color: "var(--card-bg)",
                       cursor: "pointer",
                     }}
                   >
                     Apply Size
                   </button>
                 </div>
-              </div>
-            )}
+            </div>
           </div>
 
-          <div style={cardStyle}>
+          <div
+            className="app-card"
+            style={{ ...cardStyle, boxShadow: traceOpen ? cardShadow : cardShadowCollapsed }}
+          >
             <button
               onClick={() => setTraceOpen((open) => !open)}
               style={{
@@ -1568,8 +2287,7 @@ export default function PatternEditor() {
               <span>Background Image</span>
               <span style={{ opacity: 0.7 }}>{traceOpen ? "▾" : "▸"}</span>
             </button>
-            {traceOpen && (
-              <div style={{ display: "grid", gap: 10, width: "100%" }}>
+            <div style={{ display: "grid", gap: 10, width: "100%", ...collapseStyle(traceOpen, 900) }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <label
                     style={{
@@ -1577,12 +2295,13 @@ export default function PatternEditor() {
                       alignItems: "center",
                       justifyContent: "center",
                       gap: 8,
-                      padding: "8px 12px",
+                      padding: "6px 8px",
                       borderRadius: 10,
                       border: "none",
-                      background: "#f3f3f3",
+                      background: "var(--muted-bg)",
                       color: "var(--foreground)",
                       cursor: "pointer",
+                      fontSize: 12,
                       width: "fit-content",
                     }}
                   >
@@ -1618,10 +2337,11 @@ export default function PatternEditor() {
                       padding: "6px 10px",
                       borderRadius: 8,
                       border: "none",
-                      background: "#f3f3f3",
+                      background: "var(--muted-bg)",
                       color: "var(--foreground)",
                       cursor: "pointer",
                       opacity: !traceImage || traceLocked ? 0.5 : 1,
+                      fontSize: 12,
                     }}
                   >
                     Fit to grid
@@ -1633,10 +2353,11 @@ export default function PatternEditor() {
                       padding: "6px 10px",
                       borderRadius: 8,
                       border: "none",
-                      background: "#f3f3f3",
+                      background: "var(--muted-bg)",
                       color: "var(--foreground)",
                       cursor: "pointer",
                       opacity: traceImage ? 1 : 0.5,
+                      fontSize: 12,
                     }}
                   >
                     Remove
@@ -1646,30 +2367,31 @@ export default function PatternEditor() {
                   Drag the image to move it. Drag the corners to resize. Lock it when aligned.
                 </div>
                 <div style={{ display: "flex", justifyContent: "center", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                  <div style={{ display: "inline-flex", gap: 6 }}>
+                  <div style={{ display: "inline-flex", gap: 4 }}>
                     <button
                       onClick={() => setTraceLockedState(true)}
                       disabled={!traceImage}
                       aria-pressed={traceLocked}
                       style={{
-                        padding: "8px 12px",
+                        padding: "7px 8px",
                         borderRadius: 10,
-                        border: traceLocked ? "1px solid #c26d9a" : "none",
-                        background: traceLocked ? "rgb(255 224 237)" : "#f3f3f3",
-                        color: traceLocked ? "#a84a7b" : "var(--foreground)",
+                        border: traceLocked ? "1px solid var(--accent-strong)" : "none",
+                        background: traceLocked ? "var(--accent-soft)" : "var(--muted-bg)",
+                        color: traceLocked ? "var(--accent-strong)" : "var(--foreground)",
                         cursor: "pointer",
                         display: "inline-flex",
                         alignItems: "center",
-                        gap: 6,
+                        gap: 4,
                         opacity: traceImage ? 1 : 0.5,
+                        fontSize: 13,
                       }}
                     >
                       <img
                         src={assetPath("/lock.svg")}
                         alt=""
                         aria-hidden="true"
-                        width={16}
-                        height={16}
+                        width={15}
+                        height={15}
                         style={{
                           display: "block",
                           filter: traceLocked ? "none" : "var(--icon-on-bg-filter)",
@@ -1682,24 +2404,25 @@ export default function PatternEditor() {
                       disabled={!traceImage}
                       aria-pressed={!traceLocked}
                       style={{
-                        padding: "8px 12px",
+                        padding: "7px 8px",
                         borderRadius: 10,
-                        border: !traceLocked ? "1px solid #c26d9a" : "none",
-                        background: !traceLocked ? "rgb(255 224 237)" : "#f3f3f3",
-                        color: !traceLocked ? "#a84a7b" : "var(--foreground)",
+                        border: !traceLocked ? "1px solid var(--accent-strong)" : "none",
+                        background: !traceLocked ? "var(--accent-soft)" : "var(--muted-bg)",
+                        color: !traceLocked ? "var(--accent-strong)" : "var(--foreground)",
                         cursor: "pointer",
                         display: "inline-flex",
                         alignItems: "center",
-                        gap: 6,
+                        gap: 4,
                         opacity: traceImage ? 1 : 0.5,
+                        fontSize: 13,
                       }}
                     >
                       <img
                         src={assetPath("/unlock.svg")}
                         alt=""
                         aria-hidden="true"
-                        width={16}
-                        height={16}
+                        width={15}
+                        height={15}
                         style={{
                           display: "block",
                           filter: !traceLocked ? "none" : "var(--icon-on-bg-filter)",
@@ -1709,192 +2432,100 @@ export default function PatternEditor() {
                     </button>
                   </div>
                 </div>
-              </div>
-            )}
+            </div>
           </div>
 
-          <div style={cardStyle}>
+          <div
+            className="app-card"
+            style={{ ...cardStyle, boxShadow: imageToPatternOpen ? cardShadow : cardShadowCollapsed }}
+          >
             <button
-              onClick={() => setPaletteOpen((open) => !open)}
+              onClick={() => setImageToPatternOpen((open) => !open)}
               style={{
                 display: "flex",
                 alignItems: "center",
-                justifyContent: "space-between",
+                justifyContent: "flex-start",
                 width: "100%",
                 border: "none",
                 background: "transparent",
                 padding: 0,
-                marginBottom: paletteOpen ? 12 : 0,
+                marginBottom: imageToPatternOpen ? 8 : 0,
                 cursor: "pointer",
                 fontWeight: 600,
+                textAlign: "left",
               }}
               type="button"
             >
-              <span>Palette</span>
-              <span style={{ opacity: 0.7 }}>{paletteOpen ? "▾" : "▸"}</span>
+              <span>Convert Image to Pattern</span>
+              <span style={{ opacity: 0.7, width: 14, textAlign: "center", marginLeft: "auto" }}>
+                {imageToPatternOpen ? "▾" : "▸"}
+              </span>
             </button>
-            {paletteOpen && (
-              <div style={{ display: "grid", gap: 10 }}>
-                {traceImage && (
-                  <div
-                    style={{
-                      display: "grid",
-                      gap: 6,
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      background: "rgba(0, 0, 0, 0.04)",
-                    }}
-                  >
-                    <button
-                      onClick={() => setExtractPaletteOpen((open) => !open)}
-                      type="button"
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        width: "100%",
-                        border: "none",
-                        background: "transparent",
-                        padding: 0,
-                        cursor: "pointer",
-                        fontWeight: 600,
-                        fontSize: 14,
-                        opacity: 0.85,
-                      }}
-                    >
-                      <span>Generate palette from image</span>
-                      <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
-                        {extractPaletteOpen ? "▾" : "▸"}
-                      </span>
-                    </button>
-                    {extractPaletteOpen && (
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "nowrap" }}>
-                        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{ fontSize: 12, opacity: 0.7 }}>Max colors</span>
-                          <input
-                            type="number"
-                            min={2}
-                            max={32}
-                            step={1}
-                            value={extractPaletteSize}
-                            onChange={(e) => setExtractPaletteSize(Number(e.target.value))}
-                            style={{
-                              width: 72,
-                              padding: "6px 8px",
-                              borderRadius: 8,
-                              border: "1px solid var(--panel-border)",
-                              background: "transparent",
-                              color: "var(--foreground)",
-                            }}
-                          />
-                        </label>
-                        <button
-                          onClick={extractPaletteFromTrace}
-                          disabled={extractingPalette}
-                          style={{
-                            padding: "6px 10px",
-                            borderRadius: 8,
-                            border: "none",
-                            background: "#f3f3f3",
-                            color: "var(--foreground)",
-                            cursor: "pointer",
-                            opacity: extractingPalette ? 0.5 : 1,
-                          }}
-                        >
-                          {extractingPalette ? "Generating..." : "Generate"}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )}
-                <Palette
-                  palette={palette}
-                  extractedIds={extractedIds}
-                  showExtractedFilter={Boolean(traceImage) && extractedIds.length > 0}
-                  activeColorId={activeColorId}
-                  onSelect={setActiveColorId}
-                  remapSourceId={remapSourceId}
-                  onRemapSelect={(targetId) => previewRemap(targetId)}
-                  onAddColor={addColor}
-                />
-              </div>
-            )}
-          </div>
-
-          {isNarrow && (
             <div
               style={{
-                ...cardStyle,
                 display: "grid",
-                gap: 12,
+                gap: 10,
+                width: "100%",
+                ...collapseStyle(imageToPatternOpen, 500),
               }}
             >
-              <button
-                onClick={() => setCanvasSettingsOpen((open) => !open)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  width: "100%",
-                  border: "none",
-                  background: "transparent",
-                  padding: 0,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
-                type="button"
-              >
-                <span>Canvas Settings</span>
-                <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
-                  {canvasSettingsOpen ? "▾" : "▸"}
-                </span>
-              </button>
-              {canvasSettingsOpen && (
-                <>
-                  <div
-                    style={{
-                      display: "grid",
-                      gap: 10,
-                      gridTemplateColumns: isNarrow ? "repeat(2, minmax(0, 1fr))" : "1fr",
-                    }}
-                  >
-                    <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
-                    <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
-                    {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
-                    <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
+              <div style={{ fontSize: 12, opacity: 0.7 }}>
+                Running this will overwrite the current pattern.
+              </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ fontSize: 12, opacity: 0.7 }}>Max colors</span>
+                    <span style={{ fontSize: 12, fontWeight: 600 }}>{convertMaxColors}</span>
                   </div>
-                  {traceImage && (
-                    <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
-                      <input
-                        type="range"
-                        min={0}
-                        max={100}
-                        value={Math.round(traceOpacity * 100)}
-                        onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
-                        style={{ width: 120 }}
-                      />
-                    </label>
-                  )}
-                </>
-              )}
+                  <input
+                    type="range"
+                    min={2}
+                    max={32}
+                    value={convertMaxColors}
+                    onChange={(e) => setConvertMaxColors(parseInt(e.target.value, 10))}
+                    disabled={!traceImage}
+                  />
+                </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ fontSize: 12, opacity: 0.7 }}>Smoothing</span>
+                    <span style={{ fontSize: 12, fontWeight: 600 }}>
+                      {Math.round(convertSmoothing * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(convertSmoothing * 100)}
+                    onChange={(e) => setConvertSmoothing(parseInt(e.target.value, 10) / 100)}
+                    disabled={!traceImage}
+                  />
+                </div>
+                <button
+                  onClick={convertImageToPattern}
+                  disabled={!traceImage}
+                  style={{
+                    padding: "8px 12px",
+                    borderRadius: 10,
+                    border: "none",
+                    background: "var(--muted-bg)",
+                    color: "var(--foreground)",
+                    cursor: "pointer",
+                    opacity: traceImage ? 1 : 0.5,
+                    width: "100%",
+                  }}
+                >
+                  Convert
+                </button>
             </div>
-          )}
+          </div>
 
-          {!isNarrow && usedColorsSection}
+          {isNarrow && paletteSection}
+          {isNarrow && usedColorsSection}
         </div>
 
-        <div
-          style={{
-            display: "flex",
-            gap: 24,
-            alignItems: "flex-start",
-            flex: "1 1 0",
-            minWidth: 0,
-            width: "100%",
-            flexDirection: isNarrow ? "column" : "row",
-          }}
-        >
+        <div style={{ minWidth: 0, paddingInline: 12 }}>
           {/* Canvas area */}
           <div
             ref={canvasAreaRef}
@@ -1967,20 +2598,87 @@ export default function PatternEditor() {
               darkCanvas={darkCanvas}
               onControlsHeightChange={setCanvasControlsHeight}
               showSymbols={showSymbols}
+              identifyColorId={identifyColorId}
+              symbolMap={symbolMap}
             />
-            {isNarrow && <div style={{ marginTop: 16 }}>{usedColorsSection}</div>}
           </div>
-          {!isNarrow && (
+        </div>
+        {isNarrow && (
+          <div
+            className="app-card"
+            style={{
+              ...cardStyle,
+              boxShadow: canvasSettingsOpen ? cardShadow : cardShadowCollapsed,
+              display: "grid",
+              gap: canvasSettingsOpen ? 12 : 0,
+            }}
+          >
+            <button
+              onClick={() => setCanvasSettingsOpen((open) => !open)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                width: "100%",
+                border: "none",
+                background: "transparent",
+                padding: 0,
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+              type="button"
+            >
+              <span>Canvas Settings</span>
+              <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
+                {canvasSettingsOpen ? "▾" : "▸"}
+              </span>
+            </button>
+            <div style={{ ...collapseStyle(canvasSettingsOpen, canvasSettingsMaxHeight) }}>
+              <div
+                style={{
+                  display: "grid",
+                  gap: 10,
+                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                }}
+              >
+                <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
+                <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
+                {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
+                <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
+              </div>
+              {traceImage && (
+                <label style={{ display: "grid", gap: 6, padding: "10px 0 5px" }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(traceOpacity * 100)}
+                    onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
+                    style={{ width: 120 }}
+                  />
+                </label>
+              )}
+            </div>
+          </div>
+        )}
+        {!isNarrow && (
+          <div
+            style={{
+              width: "100%",
+              minWidth: 0,
+              display: "grid",
+              gap: 16,
+            }}
+          >
             <div
+              className="app-card"
               style={{
                 ...cardStyle,
-                width: 180,
-                minWidth: 180,
-                maxWidth: "100%",
-                flex: "0 0 auto",
-                marginTop: canvasControlsHeight > 0 ? canvasControlsHeight + 10 : 0,
+                boxShadow: canvasSettingsOpen ? cardShadow : cardShadowCollapsed,
+                width: "100%",
                 display: "grid",
-                gap: 12,
+                gap: canvasSettingsOpen ? 12 : 0,
               }}
             >
               <button
@@ -1991,26 +2689,25 @@ export default function PatternEditor() {
                   justifyContent: "space-between",
                   width: "100%",
                   border: "none",
-                  background: "transparent",
-                  padding: 0,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
+                background: "transparent",
+                padding: 0,
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
                 type="button"
               >
                 <span>Canvas Settings</span>
                 <span style={{ opacity: 0.7 }}>{canvasSettingsOpen ? "▾" : "▸"}</span>
               </button>
-              {canvasSettingsOpen && (
-                <>
-                  <div style={{ display: "grid", gap: 10 }}>
+              <div style={{ ...collapseStyle(canvasSettingsOpen, canvasSettingsMaxHeight) }}>
+                  <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
                     <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
                     <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
                     {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
                     <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
                   </div>
                   {traceImage && (
-                    <label style={{ display: "grid", gap: 6 }}>
+                    <label style={{ display: "grid", gap: 6, padding: "10px 0 5px" }}>
                       <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
                       <input
                         type="range"
@@ -2022,11 +2719,12 @@ export default function PatternEditor() {
                       />
                     </label>
                   )}
-                </>
-              )}
+              </div>
             </div>
-          )}
-        </div>
+            {paletteSection}
+            {usedColorsSection}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2044,6 +2742,7 @@ function CanvasWithExportRef(props: any) {
     height,
     grid,
     paletteById,
+    symbolMap,
     activeColorId,
     cellSize,
     containerWidth,
@@ -2090,6 +2789,7 @@ function CanvasWithExportRef(props: any) {
     darkCanvas,
     onControlsHeightChange,
     showSymbols,
+    identifyColorId,
   } = props;
 
   // Render the interactive canvas
@@ -2097,6 +2797,11 @@ function CanvasWithExportRef(props: any) {
   const exportCellSize = EXPORT_CELL_SIZE;
   const zoomPercent = Math.round(zoom * 100);
   const [zoomInput, setZoomInput] = useState(String(zoomPercent));
+  const activeColor = paletteById.get(activeColorId);
+  const canvasCardRef = useRef<HTMLDivElement | null>(null);
+  const zoomRowRef = useRef<HTMLDivElement | null>(null);
+  const [alignTop, setAlignTop] = useState(false);
+  const [panToTopTick, setPanToTopTick] = useState(0);
 
   useEffect(() => {
     setZoomInput(String(zoomPercent));
@@ -2117,6 +2822,23 @@ function CanvasWithExportRef(props: any) {
     const clamped = Math.min(maxValue, Math.max(minValue, parsed));
     onZoomChange(clamped / 100);
     setZoomInput(String(Math.round(clamped)));
+  }
+
+  function fitToHeight() {
+    if (!canvasCardRef.current) return;
+    const rect = canvasCardRef.current.getBoundingClientRect();
+    const rowHeight = zoomRowRef.current?.getBoundingClientRect().height ?? 0;
+    const padding = 12;
+    const gap = 10;
+    const bottomPadding = 24;
+    const available = window.innerHeight - rect.top - bottomPadding - rowHeight - gap - padding * 2;
+    if (!Number.isFinite(available) || available <= 0) return;
+    const baseCellSize = cellSize / (zoom || 1);
+    if (!Number.isFinite(baseCellSize) || baseCellSize <= 0) return;
+    const nextZoom = available / (height * baseCellSize);
+    onZoomChange(nextZoom);
+    setAlignTop(true);
+    setPanToTopTick((tick) => tick + 1);
   }
 
   const controlsRef = useRef<HTMLDivElement | null>(null);
@@ -2140,11 +2862,11 @@ function CanvasWithExportRef(props: any) {
         <div
           className="canvas-toolbar"
           style={{
-            background: "#ffffff",
+            background: "var(--card-bg)",
             border: "none",
             borderRadius: 12,
             padding: 12,
-            boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
+            boxShadow: "none",
             display: "flex",
             gap: 8,
             alignItems: "center",
@@ -2290,7 +3012,8 @@ function CanvasWithExportRef(props: any) {
               />
             </button>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginLeft: "auto" }}>
+          <div style={{ flex: "1 1 auto" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             {!pinchEnabled && (
               <>
                 <span style={{ fontSize: 12, opacity: 0.7 }}>Tool size</span>
@@ -2324,8 +3047,9 @@ function CanvasWithExportRef(props: any) {
       </div>
 
       <div
+        ref={canvasCardRef}
         style={{
-          background: "#ffffff",
+          background: "var(--card-bg)",
           border: "none",
           borderRadius: 12,
           padding: 12,
@@ -2334,7 +3058,25 @@ function CanvasWithExportRef(props: any) {
           gap: 10,
         }}
       >
-        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <div
+          ref={zoomRowRef}
+          style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 6,
+                border: "1px solid rgba(0,0,0,0.2)",
+                background: activeColor?.hex ?? "transparent",
+                display: "inline-block",
+              }}
+            />
+            <span style={{ fontSize: 12, opacity: 0.7 }}>
+              {activeColor ? `${activeColor.name}${activeColor.code ? ` #${activeColor.code}` : ""}` : "No color"}
+            </span>
+          </div>
           <label className="zoom-row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <button
@@ -2371,17 +3113,35 @@ function CanvasWithExportRef(props: any) {
                   +
                 </button>
                 <button
-                  onClick={() => onZoomChange(1)}
+                  onClick={() => {
+                    setAlignTop(false);
+                    onZoomChange(1);
+                  }}
                   style={{
                     padding: "6px 10px",
                     borderRadius: 8,
                     border: "none",
-                      background: "#f3f3f3",
+                    background: "var(--muted-bg)",
                     color: "var(--foreground)",
                     cursor: "pointer",
+                    fontSize: 12,
                   }}
                 >
-                  Fit
+                  Fit width
+                </button>
+                <button
+                  onClick={fitToHeight}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "none",
+                    background: "var(--muted-bg)",
+                    color: "var(--foreground)",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                >
+                  Fit height
                 </button>
                 <input
                   type="text"
@@ -2409,10 +3169,14 @@ function CanvasWithExportRef(props: any) {
           height={height}
           grid={grid}
           paletteById={paletteById}
+          symbolMap={symbolMap}
           activeColorId={activeColorId}
+          identifyColorId={identifyColorId}
           cellSize={cellSize}
           containerWidth={containerWidth}
           containerHeight={containerHeight}
+          alignTop={alignTop}
+          panToTopToken={panToTopTick}
           showGridlines={showGridlines}
           tool={tool}
           brushSize={brushSize}
@@ -2457,6 +3221,7 @@ function CanvasWithExportRef(props: any) {
           height={height}
           grid={grid}
           paletteById={paletteById}
+          symbolMap={symbolMap}
           cellSize={exportCellSize}
           showGridlines={true}
         />
@@ -2471,6 +3236,7 @@ function ExportCanvas({
   height,
   grid,
   paletteById,
+  symbolMap,
   cellSize,
   showGridlines,
 }: {
@@ -2479,18 +3245,10 @@ function ExportCanvas({
   height: number;
   grid: Uint16Array;
   paletteById: Map<number, Color>;
+  symbolMap?: Map<number, string>;
   cellSize: number;
   showGridlines: boolean;
 }) {
-  function contrastForHex(hex: string) {
-    const clean = hex.replace("#", "");
-    if (clean.length !== 6) return "#000000";
-    const r = parseInt(clean.slice(0, 2), 16);
-    const g = parseInt(clean.slice(2, 4), 16);
-    const b = parseInt(clean.slice(4, 6), 16);
-    const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-    return luminance > 0.6 ? "#000000" : "#ffffff";
-  }
   const canvasW = width * cellSize;
   const canvasH = height * cellSize;
 
@@ -2515,7 +3273,7 @@ function ExportCanvas({
         ctx.fillStyle = color.hex;
         ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
 
-        const symbol = symbolForColorId(color.id);
+        const symbol = symbolForColorId(color.id, symbolMap);
         if (symbol) {
           ctx.save();
           ctx.fillStyle = contrastForHex(color.hex);
@@ -2544,7 +3302,18 @@ function ExportCanvas({
         ctx.stroke();
       }
     }
-  }, [exportCanvasRef, canvasW, canvasH, width, height, grid, paletteById, cellSize, showGridlines]);
+  }, [
+    exportCanvasRef,
+    canvasW,
+    canvasH,
+    width,
+    height,
+    grid,
+    paletteById,
+    symbolMap,
+    cellSize,
+    showGridlines,
+  ]);
 
   return <canvas ref={exportCanvasRef} />;
 }

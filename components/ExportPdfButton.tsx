@@ -10,6 +10,7 @@ type Props = {
   usedColors: { color: Color; count: number }[];
   grid: Uint16Array;
   paletteById: Map<number, Color>;
+  symbolMap?: Map<number, string>;
   width: number;
   height: number;
   cellSize: number;
@@ -21,6 +22,7 @@ export default function ExportPdfButton({
   usedColors,
   grid,
   paletteById,
+  symbolMap,
   width,
   height,
   cellSize,
@@ -30,15 +32,16 @@ export default function ExportPdfButton({
       onClick={() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
-        exportPatternPdf({ title, canvas, usedColors, grid, paletteById, width, height, cellSize });
+        exportPatternPdf({ title, canvas, usedColors, grid, paletteById, symbolMap, width, height, cellSize });
       }}
       style={{
         padding: "10px 12px",
         borderRadius: 10,
         border: "none",
-        background: "#e48ab0",
+        background: "var(--accent)",
         color: "#ffffff",
         cursor: "pointer",
+        width: "100%",
       }}
     >
       Export PDF

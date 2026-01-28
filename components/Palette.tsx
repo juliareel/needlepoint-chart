@@ -7,9 +7,12 @@ type Props = {
   palette: Color[];
   extractedIds?: number[];
   showExtractedFilter?: boolean;
+  usedIds?: number[];
+  showUsedFilter?: boolean;
   activeColorId: number;
   onSelect: (id: number) => void;
   remapSourceId?: number | null;
+  remapTargetId?: number | null;
   onRemapSelect?: (id: number) => void;
   onAddColor: (name: string, hex: string) => void;
 };
@@ -18,9 +21,12 @@ export default function Palette({
   palette,
   extractedIds,
   showExtractedFilter = true,
+  usedIds,
+  showUsedFilter = true,
   activeColorId,
   onSelect,
   remapSourceId,
+  remapTargetId,
   onRemapSelect,
   onAddColor,
 }: Props) {
@@ -83,11 +89,15 @@ export default function Palette({
     return ["All", ...order.filter((f) => f !== "All" && set.has(f)), ...rest];
   }, [palette]);
   const extractedSet = useMemo(() => new Set(extractedIds ?? []), [extractedIds]);
+  const usedSet = useMemo(() => new Set(usedIds ?? []), [usedIds]);
   const hasExtracted = extractedSet.size > 0;
+  const hasUsed = usedSet.size > 0;
   const filteredPalette = useMemo(() => {
     const familyFiltered =
       activeFamily === "Extracted"
         ? sortedPalette.filter((c) => extractedSet.has(c.id))
+        : activeFamily === "Used"
+          ? sortedPalette.filter((c) => usedSet.has(c.id))
         : activeFamily === "All"
           ? sortedPalette
           : sortedPalette.filter((c) => c.family === activeFamily);
@@ -98,7 +108,7 @@ export default function Palette({
       const code = (c.code ?? "").toLowerCase();
       return name.includes(q) || code.includes(q) || `#${code}`.includes(q);
     });
-  }, [sortedPalette, activeFamily, query, extractedSet]);
+  }, [sortedPalette, activeFamily, query, extractedSet, usedSet]);
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
@@ -109,26 +119,28 @@ export default function Palette({
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search name or #DMC"
             style={{
-              padding: "8px 10px",
+              padding: "6px 8px",
               borderRadius: 8,
               border: "1px solid var(--panel-border)",
               background: "transparent",
               color: "var(--foreground)",
+              fontSize: 12,
             }}
           />
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <span style={{ fontSize: 12, opacity: 0.7 }}>Family</span>
             <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
               <select
-                value={activeFamily === "Extracted" ? "All" : activeFamily}
+                value={activeFamily === "Extracted" || activeFamily === "Used" ? "All" : activeFamily}
                 onChange={(e) => setActiveFamily(e.target.value)}
                 style={{
-                  padding: "6px 28px 6px 10px",
+                  padding: "4px 24px 4px 8px",
                   borderRadius: 8,
                   border: "none",
-                  background: "#f3f3f3",
+                  background: "var(--muted-bg)",
                   color: "var(--foreground)",
                   fontWeight: 600,
+                  fontSize: 12,
                   appearance: "none",
                   WebkitAppearance: "none",
                   MozAppearance: "none",
@@ -144,8 +156,8 @@ export default function Palette({
                 aria-hidden="true"
                 style={{
                   position: "absolute",
-                  right: 8,
-                  fontSize: 12,
+                  right: 6,
+                  fontSize: 10,
                   opacity: 0.6,
                   pointerEvents: "none",
                 }}
@@ -153,6 +165,29 @@ export default function Palette({
                 ▾
               </span>
             </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {showUsedFilter && hasUsed && (
+              <button
+                type="button"
+                onClick={() => setActiveFamily(activeFamily === "Used" ? "All" : "Used")}
+                style={{
+                  padding: "6px 8px",
+                  borderRadius: 8,
+                  border: activeFamily === "Used" ? "1px solid var(--accent-strong)" : "none",
+                  background: activeFamily === "Used" ? "var(--accent-soft)" : "var(--muted-bg)",
+                  color: activeFamily === "Used" ? "var(--accent-strong)" : "var(--foreground)",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  textAlign: "center",
+                  fontSize: 11,
+                }}
+              >
+                Used Colors
+              </button>
+            )}
             {showExtractedFilter && hasExtracted && (
               <button
                 type="button"
@@ -160,20 +195,18 @@ export default function Palette({
                 style={{
                   padding: "6px 8px",
                   borderRadius: 8,
-                  border: activeFamily === "Extracted" ? "1px solid #c26d9a" : "none",
-                  background: activeFamily === "Extracted" ? "rgb(255 224 237)" : "#f3f3f3",
-                  color: activeFamily === "Extracted" ? "#a84a7b" : "var(--foreground)",
+                  border: activeFamily === "Extracted" ? "1px solid var(--accent-strong)" : "none",
+                  background: activeFamily === "Extracted" ? "var(--accent-soft)" : "var(--muted-bg)",
+                  color: activeFamily === "Extracted" ? "var(--accent-strong)" : "var(--foreground)",
                   cursor: "pointer",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
                   textAlign: "center",
+                  fontSize: 11,
                 }}
               >
-                <span style={{ display: "block", lineHeight: 1.1, textAlign: "center" }}>
-                  <span style={{ display: "block" }}>Image</span>
-                  <span style={{ display: "block" }}>Colors</span>
-                </span>
+                Image Colors
               </button>
             )}
           </div>
@@ -181,15 +214,19 @@ export default function Palette({
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(42px, 1fr))",
-            gap: 8,
-            maxHeight: 220,
+            gridTemplateColumns: "repeat(auto-fill, minmax(36px, 1fr))",
+            gap: 6,
+            maxHeight: 240,
             overflowY: "auto",
             paddingRight: 4,
             overscrollBehavior: "contain",
           }}
         >
-          {filteredPalette.map((c) => (
+          {filteredPalette.map((c) => {
+            const isRemapTarget = remapTargetId != null && c.id === remapTargetId;
+            const isRemapSource = remapSourceId != null && c.id === remapSourceId;
+            const showRemapSource = isRemapSource && (remapTargetId == null || remapTargetId === remapSourceId);
+            return (
             <button
               key={c.id}
               onClick={() => {
@@ -201,12 +238,12 @@ export default function Palette({
               }}
               style={{
                 display: "grid",
-                gap: 4,
+                gap: 3,
                 justifyItems: "center",
-                padding: 4,
+                padding: 3,
                 borderRadius: 8,
                 border:
-                  remapSourceId === c.id
+                  isRemapTarget || showRemapSource
                     ? "2px solid var(--foreground)"
                     : c.id === activeColorId
                     ? "2px solid var(--foreground)"
@@ -219,17 +256,17 @@ export default function Palette({
             >
               <span
                 style={{
-                  width: 30,
-                  height: 30,
-                  borderRadius: 6,
+                  width: 26,
+                  height: 26,
+                  borderRadius: 5,
                   background: c.hex,
                   display: "inline-block",
                   boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.15)",
                 }}
               />
-              <span style={{ fontSize: 10, opacity: 0.75, lineHeight: 1 }}>{c.code ?? ""}</span>
+              <span style={{ fontSize: 9, opacity: 0.75, lineHeight: 1 }}>{c.code ?? ""}</span>
             </button>
-          ))}
+          )})}
         </div>
       </div>
 

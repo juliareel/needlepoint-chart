@@ -1,8 +1,65 @@
-export const SYMBOLS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*+=?/<>[]{}()~;:"
-  .split("")
-  .filter((char) => char.trim().length > 0);
+export const SYMBOLS = [
+  "!",
+  "@",
+  "#",
+  "$",
+  "%",
+  "^",
+  "&",
+  "*",
+  "(",
+  ")",
+  "?",
+  "+",
+  "=",
+  "~",
+  "/",
+  "\\",
+  "|",
+  "<",
+  ">",
+  "[",
+  "]",
+  "{",
+  "}",
+  "A",
+  "B",
+  "C",
+  "D",
+  "E",
+  "F",
+  "G",
+  "H",
+  "J",
+  "K",
+  "L",
+  "M",
+  "N",
+  "P",
+  "Q",
+  "R",
+  "T",
+  "U",
+  "V",
+  "W",
+  "X",
+  "Y",
+  "Z",
+  "2",
+  "3",
+  "4",
+  "6",
+  "7",
+  "8",
+  "9",
+  "5",
+];
 
-export function symbolForColorId(id: number) {
+export function symbolForColorId(id: number, symbolMap?: Map<number, string>) {
+  if (symbolMap && symbolMap.size > 0) {
+    const mapped = symbolMap.get(id);
+    if (mapped) return mapped;
+  }
   if (SYMBOLS.length === 0) return "";
   return SYMBOLS[Math.abs(id) % SYMBOLS.length];
 }

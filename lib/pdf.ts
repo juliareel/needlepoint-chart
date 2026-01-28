@@ -9,11 +9,12 @@ export function exportPatternPdf(opts: {
   usedColors: { color: Color; count: number }[];
   grid: Uint16Array;
   paletteById: Map<number, Color>;
+  symbolMap?: Map<number, string>;
   width: number;
   height: number;
   cellSize: number;
 }) {
-  const { title, canvas, usedColors, grid, paletteById, width, height, cellSize } = opts;
+  const { title, canvas, usedColors, grid, paletteById, symbolMap, width, height, cellSize } = opts;
 
   const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "letter" });
   const pageW = pdf.internal.pageSize.getWidth();
@@ -65,7 +66,7 @@ export function exportPatternPdf(opts: {
       pdf.setFillColor(rgb.r, rgb.g, rgb.b);
       pdf.rect(margin, y - swatch + 2, swatch, swatch, "F");
     }
-    const symbol = symbolForColorId(color.id);
+    const symbol = symbolForColorId(color.id, symbolMap);
     if (symbol) {
       const textColor = rgb ? contrastForRgb(rgb.r, rgb.g, rgb.b) : { r: 0, g: 0, b: 0 };
       pdf.setTextColor(textColor.r, textColor.g, textColor.b);
@@ -80,7 +81,7 @@ export function exportPatternPdf(opts: {
     y += 14;
   });
 
-  const symbolCanvas = renderSymbolCanvas({ grid, paletteById, width, height, cellSize });
+  const symbolCanvas = renderSymbolCanvas({ grid, paletteById, symbolMap, width, height, cellSize });
   pdf.addPage();
   addChartPage(`${titleText} (Symbols Only)`, symbolCanvas);
 
@@ -90,11 +91,12 @@ export function exportPatternPdf(opts: {
 function renderSymbolCanvas(opts: {
   grid: Uint16Array;
   paletteById: Map<number, Color>;
+  symbolMap?: Map<number, string>;
   width: number;
   height: number;
   cellSize: number;
 }) {
-  const { grid, paletteById, width, height, cellSize } = opts;
+  const { grid, paletteById, symbolMap, width, height, cellSize } = opts;
   const canvas = document.createElement("canvas");
   const canvasW = width * cellSize;
   const canvasH = height * cellSize;
@@ -112,7 +114,7 @@ function renderSymbolCanvas(opts: {
       if (colorId === 0) continue;
       const color = paletteById.get(colorId);
       if (!color) continue;
-      const symbol = symbolForColorId(color.id);
+      const symbol = symbolForColorId(color.id, symbolMap);
       if (!symbol) continue;
       ctx.save();
       ctx.fillStyle = "#000000";

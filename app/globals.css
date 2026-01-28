@@ -1,11 +1,17 @@
 @import "tailwindcss";
 
 :root {
-  --background: rgb(250 245 255);
+  --background: #f2dff7;
   --foreground: #171717;
+  --card-bg: #ffffff;
+  --muted-bg: #e6e6e6;
+  --accent: #d08de3;
+  --accent-soft: #e1b6ed;
+  --accent-strong: #bf64d9;
+  --accent-wash: #f2dff7;
   --icon-on-bg-filter: invert(0);
   --icon-on-fg-filter: invert(1);
-  --panel-border: rgba(0, 0, 0, 0.3);
+  --panel-border: #d08de3;
 }
 
 @theme inline {
@@ -27,7 +33,7 @@
 
 html,
 body {
-  background: rgb(250 245 255);
+  background: var(--background);
   color: var(--foreground);
   font-family: var(--font-ui), ui-sans-serif, system-ui;
   min-height: 100%;
@@ -36,6 +42,82 @@ body {
 
 button {
   font-weight: 600;
+  transition: background-color 150ms ease, color 150ms ease, filter 150ms ease, opacity 150ms ease;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(0.94);
+  transform: none;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+.app-card {
+  position: relative;
+  z-index: 0;
+  transition: box-shadow 160ms ease;
+}
+
+.app-card:hover {
+  z-index: 2;
+}
+
+.canvas-toolbar button {
+  box-shadow: none;
+  outline: none;
+}
+
+.canvas-toolbar button:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  outline: none;
+  box-shadow: none;
+}
+
+input[type="range"]:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--muted-bg);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--card-bg);
+  border: 1px solid var(--accent);
+  margin-top: -4px;
+  box-shadow: none;
+}
+
+input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--muted-bg);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--card-bg);
+  border: 1px solid var(--accent);
+  box-shadow: none;
 }
 
 @media (max-width: 900px) {
