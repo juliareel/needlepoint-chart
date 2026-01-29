@@ -967,7 +967,7 @@ export default function GridCanvas(props: Props) {
         display: "inline-flex",
         justifyContent: alignX,
         alignItems: alignY,
-        justifySelf: "start",
+        justifySelf: "center",
         alignSelf: "start",
         width: containerWidth || canvasW,
         height: containerHeight || canvasH,

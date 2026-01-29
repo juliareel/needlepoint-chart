@@ -2017,7 +2017,7 @@ export default function PatternEditor() {
         style={{
           display: "grid",
           columnGap: 12,
-          rowGap: 24,
+          rowGap: 16,
           alignItems: "start",
           width: "100%",
           minWidth: 0,
@@ -2190,58 +2190,88 @@ export default function PatternEditor() {
                 {draftGridMode === "stitches" ? (
                   <>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <span>Width (stitches)</span>
+                      <span style={{ fontSize: 14 }}>Width (stitches)</span>
                     <input
                       type="number"
                       min={1}
                       value={draftGridW}
                       onChange={(e) => setDraftGridW(parseInt(e.target.value || "1", 10))}
-                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{
+                        width: 72,
+                        padding: 6,
+                        borderRadius: 8,
+                        border: "1px solid rgba(0,0,0,0.2)",
+                        fontSize: 14,
+                      }}
                     />
                     </label>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <span>Height (stitches)</span>
+                      <span style={{ fontSize: 14 }}>Height (stitches)</span>
                     <input
                       type="number"
                       min={1}
                       value={draftGridH}
                       onChange={(e) => setDraftGridH(parseInt(e.target.value || "1", 10))}
-                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{
+                        width: 72,
+                        padding: 6,
+                        borderRadius: 8,
+                        border: "1px solid rgba(0,0,0,0.2)",
+                        fontSize: 14,
+                      }}
                     />
                     </label>
                   </>
                 ) : (
                   <>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <span>Width (inches)</span>
+                      <span style={{ fontSize: 14 }}>Width (inches)</span>
                     <input
                       type="number"
                       min={0.1}
                       step={0.1}
                       value={draftWidthIn}
                       onChange={(e) => setDraftWidthIn(parseFloat(e.target.value || "0"))}
-                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{
+                        width: 72,
+                        padding: 6,
+                        borderRadius: 8,
+                        border: "1px solid rgba(0,0,0,0.2)",
+                        fontSize: 14,
+                      }}
                     />
                     </label>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <span>Height (inches)</span>
+                      <span style={{ fontSize: 14 }}>Height (inches)</span>
                     <input
                       type="number"
                       min={0.1}
                       step={0.1}
                       value={draftHeightIn}
                       onChange={(e) => setDraftHeightIn(parseFloat(e.target.value || "0"))}
-                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{
+                        width: 72,
+                        padding: 6,
+                        borderRadius: 8,
+                        border: "1px solid rgba(0,0,0,0.2)",
+                        fontSize: 14,
+                      }}
                     />
                     </label>
                     <label style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <span>Mesh (stitches/in)</span>
+                      <span style={{ fontSize: 14 }}>Mesh (stitches/in)</span>
                     <input
                       type="number"
                       min={1}
                       value={draftMeshCount}
                       onChange={(e) => setDraftMeshCount(parseInt(e.target.value || "1", 10))}
-                      style={{ width: 72, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                      style={{
+                        width: 72,
+                        padding: 6,
+                        borderRadius: 8,
+                        border: "1px solid rgba(0,0,0,0.2)",
+                        fontSize: 14,
+                      }}
                     />
                     </label>
                   </>
@@ -2521,11 +2551,72 @@ export default function PatternEditor() {
             </div>
           </div>
 
-          {isNarrow && paletteSection}
-          {isNarrow && usedColorsSection}
         </div>
 
-        <div style={{ minWidth: 0, paddingInline: 12 }}>
+        <div
+          className="pattern-canvas-shell"
+          style={{ minWidth: 0, paddingInline: "var(--canvas-shell-padding, 12px)" }}
+        >
+          {isNarrow && (
+            <div
+              className="app-card"
+              style={{
+                ...cardStyle,
+                boxShadow: canvasSettingsOpen ? cardShadow : cardShadowCollapsed,
+                display: "grid",
+                gap: canvasSettingsOpen ? 12 : 0,
+                marginBottom: 16,
+              }}
+            >
+              <button
+                onClick={() => setCanvasSettingsOpen((open) => !open)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  width: "100%",
+                  border: "none",
+                  background: "transparent",
+                  padding: 0,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+                type="button"
+              >
+                <span>Canvas Settings</span>
+                <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
+                  {canvasSettingsOpen ? "▾" : "▸"}
+                </span>
+              </button>
+              <div style={{ ...collapseStyle(canvasSettingsOpen, canvasSettingsMaxHeight) }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gap: 10,
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                  }}
+                >
+                  <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
+                  <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
+                  {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
+                  <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
+                </div>
+                {traceImage && (
+                  <label style={{ display: "grid", gap: 6, padding: "10px 0 5px" }}>
+                    <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={Math.round(traceOpacity * 100)}
+                      onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
+                      style={{ width: 120 }}
+                    />
+                  </label>
+                )}
+              </div>
+            </div>
+          )}
           {/* Canvas area */}
           <div
             ref={canvasAreaRef}
@@ -2533,6 +2624,7 @@ export default function PatternEditor() {
             style={{
               minWidth: 0,
               flex: "1 1 0",
+              paddingBottom: isNarrow ? 0 : undefined,
             }}
           >
             <CanvasWithExportRef
@@ -2603,65 +2695,8 @@ export default function PatternEditor() {
             />
           </div>
         </div>
-        {isNarrow && (
-          <div
-            className="app-card"
-            style={{
-              ...cardStyle,
-              boxShadow: canvasSettingsOpen ? cardShadow : cardShadowCollapsed,
-              display: "grid",
-              gap: canvasSettingsOpen ? 12 : 0,
-            }}
-          >
-            <button
-              onClick={() => setCanvasSettingsOpen((open) => !open)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                width: "100%",
-                border: "none",
-                background: "transparent",
-                padding: 0,
-                cursor: "pointer",
-                fontWeight: 600,
-              }}
-              type="button"
-            >
-              <span>Canvas Settings</span>
-              <span style={{ opacity: 0.7, width: 14, textAlign: "center" }}>
-                {canvasSettingsOpen ? "▾" : "▸"}
-              </span>
-            </button>
-            <div style={{ ...collapseStyle(canvasSettingsOpen, canvasSettingsMaxHeight) }}>
-              <div
-                style={{
-                  display: "grid",
-                  gap: 10,
-                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                }}
-              >
-                <Toggle label="Show gridlines" checked={showGridlines} onChange={setShowGridlines} />
-                <Toggle label="Thread view" checked={threadView} onChange={setThreadView} />
-                {/* <Toggle label="Dark canvas" checked={darkCanvas} onChange={setDarkCanvas} /> */}
-                <Toggle label="Color symbols" checked={showSymbols} onChange={setShowSymbols} />
-              </div>
-              {traceImage && (
-                <label style={{ display: "grid", gap: 6, padding: "10px 0 5px" }}>
-                  <span style={{ fontSize: 12, opacity: 0.7 }}>Image opacity</span>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={Math.round(traceOpacity * 100)}
-                    onChange={(e) => setTraceOpacity(parseInt(e.target.value, 10) / 100)}
-                    style={{ width: 120 }}
-                  />
-                </label>
-              )}
-            </div>
-          </div>
-        )}
+        {isNarrow && paletteSection}
+        {isNarrow && usedColorsSection}
         {!isNarrow && (
           <div
             style={{
@@ -2865,7 +2900,7 @@ function CanvasWithExportRef(props: any) {
             background: "var(--card-bg)",
             border: "none",
             borderRadius: 12,
-            padding: 12,
+            padding: "var(--canvas-toolbar-padding, 12px)",
             boxShadow: "none",
             display: "flex",
             gap: 8,
@@ -3052,7 +3087,7 @@ function CanvasWithExportRef(props: any) {
           background: "var(--card-bg)",
           border: "none",
           borderRadius: 12,
-          padding: 12,
+          padding: "var(--canvas-card-padding, 12px)",
           boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
           display: "grid",
           gap: 10,
@@ -3065,88 +3100,58 @@ function CanvasWithExportRef(props: any) {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span
               style={{
-                width: 18,
-                height: 18,
-                borderRadius: 6,
+                width: 24,
+                height: 24,
+                borderRadius: 8,
                 border: "1px solid rgba(0,0,0,0.2)",
                 background: activeColor?.hex ?? "transparent",
                 display: "inline-block",
               }}
             />
-            <span style={{ fontSize: 12, opacity: 0.7 }}>
-              {activeColor ? `${activeColor.name}${activeColor.code ? ` #${activeColor.code}` : ""}` : "No color"}
+            <span style={{ fontSize: 14, opacity: 0.7, fontWeight: 600 }}>
+              {activeColor?.code ? `#${activeColor.code}` : ""}
             </span>
           </div>
-          <label className="zoom-row" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                <button
-                  onClick={() => onZoomChange(Math.max(minZoom, Number((zoom - 0.1).toFixed(2))))}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: 8,
-                    border: "none",
-                    background: "transparent",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                  }}
-                >
-                -
+          <div
+            className="zoom-row"
+            style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}
+          >
+            <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                onClick={() => {
+                  setAlignTop(false);
+                  onZoomChange(1);
+                }}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "var(--muted-bg)",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+              >
+                Fit width
+              </button>
+              <button
+                onClick={fitToHeight}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "var(--muted-bg)",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+              >
+                Fit height
               </button>
               <input
-                type="range"
-                min={Math.round(minZoom * 100)}
-                max={Math.round(maxZoom * 100)}
-                value={Math.round(zoom * 100)}
-                onChange={(e) => onZoomChange(parseInt(e.target.value, 10) / 100)}
-              />
-                <button
-                  onClick={() => onZoomChange(Math.min(maxZoom, Number((zoom + 0.1).toFixed(2))))}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: 8,
-                    border: "none",
-                    background: "transparent",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                  }}
-                >
-                  +
-                </button>
-                <button
-                  onClick={() => {
-                    setAlignTop(false);
-                    onZoomChange(1);
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: 8,
-                    border: "none",
-                    background: "var(--muted-bg)",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                  }}
-                >
-                  Fit width
-                </button>
-                <button
-                  onClick={fitToHeight}
-                  style={{
-                    padding: "6px 10px",
-                    borderRadius: 8,
-                    border: "none",
-                    background: "var(--muted-bg)",
-                    color: "var(--foreground)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                  }}
-                >
-                  Fit height
-                </button>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  value={zoomInput}
+                type="text"
+                inputMode="numeric"
+                value={zoomInput}
                 onChange={(e) => {
                   const next = e.target.value.replace(/[^\d]/g, "");
                   setZoomInput(next);
@@ -3158,11 +3163,55 @@ function CanvasWithExportRef(props: any) {
                     (e.target as HTMLInputElement).blur();
                   }
                 }}
-                style={{ width: 64, padding: 6, borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)" }}
+                style={{
+                  width: 60,
+                  height: 28,
+                  padding: "0 6px",
+                  borderRadius: 8,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  fontSize: 12,
+                  lineHeight: "26px",
+                }}
               />
               <span style={{ fontSize: 12, opacity: 0.7 }}>%</span>
             </div>
-          </label>
+            <div style={{ display: "flex", gap: 4, alignItems: "center", width: "100%" }}>
+              <button
+                onClick={() => onZoomChange(Math.max(minZoom, Number((zoom - 0.1).toFixed(2))))}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                }}
+              >
+                -
+              </button>
+              <input
+                type="range"
+                min={Math.round(minZoom * 100)}
+                max={Math.round(maxZoom * 100)}
+                value={Math.round(zoom * 100)}
+                onChange={(e) => onZoomChange(parseInt(e.target.value, 10) / 100)}
+                style={{ flex: 1 }}
+              />
+              <button
+                onClick={() => onZoomChange(Math.min(maxZoom, Number((zoom + 0.1).toFixed(2))))}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                }}
+              >
+                +
+              </button>
+            </div>
+          </div>
         </div>
         <GridCanvas
           width={width}
