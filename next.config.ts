@@ -1,12 +1,9 @@
 import type { NextConfig } from "next";
 
-const nextConfig = {
+const nextConfig: NextConfig = {
   output: "export",
   images: { unoptimized: true },
-  basePath: "/needlepoint-chart",
-  assetPrefix: "/needlepoint-chart/",
-  env: {
-    NEXT_PUBLIC_BASE_PATH: "/needlepoint-chart",
-  },
+  // remove basePath and assetPrefix for root hosting
 };
+
 export default nextConfig;
