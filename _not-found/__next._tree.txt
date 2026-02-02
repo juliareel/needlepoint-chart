@@ -1,0 +1,2 @@
+:HL["/needlepoint-chart/_next/static/chunks/fe7af4aebcef1af7.css","style"]
+0:{"buildId":"J_PwApiA_zF7dEhd670yN","tree":{"name":"","paramType":null,"paramKey":"","hasRuntimePrefetch":false,"slots":{"children":{"name":"/_not-found","paramType":null,"paramKey":"/_not-found","hasRuntimePrefetch":false,"slots":{"children":{"name":"__PAGE__","paramType":null,"paramKey":"__PAGE__","hasRuntimePrefetch":false,"slots":null,"isRootLayout":false}},"isRootLayout":false}},"isRootLayout":true},"staleTime":300}

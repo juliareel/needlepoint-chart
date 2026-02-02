@@ -2,5 +2,5 @@
 2:I[49770,["/needlepoint-chart/_next/static/chunks/642c449b1bd44a1f.js","/needlepoint-chart/_next/static/chunks/8c7ba56f998fcfe8.js"],"default"]
 3:I[97367,["/needlepoint-chart/_next/static/chunks/2f236954d6a65e12.js"],"OutletBoundary"]
 4:"$Sreact.suspense"
-0:{"buildId":"AAbw_JJwz069XjGq_RtBB","rsc":["$","$1","c",{"children":[["$","$L2",null,{}],[["$","script","script-0",{"src":"/needlepoint-chart/_next/static/chunks/642c449b1bd44a1f.js","async":true}],["$","script","script-1",{"src":"/needlepoint-chart/_next/static/chunks/8c7ba56f998fcfe8.js","async":true}]],["$","$L3",null,{"children":["$","$4",null,{"name":"Next.MetadataOutlet","children":"$@5"}]}]]}],"loading":null,"isPartial":false}
+0:{"buildId":"J_PwApiA_zF7dEhd670yN","rsc":["$","$1","c",{"children":[["$","$L2",null,{}],[["$","script","script-0",{"src":"/needlepoint-chart/_next/static/chunks/642c449b1bd44a1f.js","async":true}],["$","script","script-1",{"src":"/needlepoint-chart/_next/static/chunks/8c7ba56f998fcfe8.js","async":true}]],["$","$L3",null,{"children":["$","$4",null,{"name":"Next.MetadataOutlet","children":"$@5"}]}]]}],"loading":null,"isPartial":false}
 5:null
