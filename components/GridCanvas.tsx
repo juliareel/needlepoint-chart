@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Color } from "../lib/grid";
 import { idx } from "../lib/grid";
 import { assetPath } from "../lib/assetPath";
@@ -16,13 +16,14 @@ type Props = {
   cellSize: number;
   containerWidth: number;
   containerHeight: number;
-  alignTop?: boolean;
-  panToTopToken?: number;
   zoom: number;
   minZoom: number;
   maxZoom: number;
   pinchEnabled: boolean;
   onZoomChange: (nextZoom: number) => void;
+  centerCanvasToken?: number;
+  focusCell?: { x: number; y: number } | null;
+  focusCellToken?: number;
   threadView: boolean;
   darkCanvas: boolean;
   showSymbols: boolean;
@@ -52,6 +53,10 @@ type Props = {
   onPaintCell: (x: number, y: number, colorId: number) => void;
   onFillCells?: (indices: number[], colorId: number) => void;
   onFillGrid?: (nextGrid: Uint16Array) => void;
+  filterRect?: { x0: number; y0: number; x1: number; y1: number } | null;
+  filterSelecting?: boolean;
+  onFilterRectChange?: (rect: { x0: number; y0: number; x1: number; y1: number } | null) => void;
+  onFilterSelectEnd?: () => void;
 };
 
 export default function GridCanvas(props: Props) {
@@ -65,13 +70,14 @@ export default function GridCanvas(props: Props) {
     cellSize,
     containerWidth,
     containerHeight,
-    alignTop = false,
-    panToTopToken,
     zoom,
     minZoom,
     maxZoom,
     pinchEnabled,
     onZoomChange,
+    centerCanvasToken,
+    focusCell,
+    focusCellToken,
     threadView,
     darkCanvas,
     showSymbols,
@@ -101,6 +107,10 @@ export default function GridCanvas(props: Props) {
     onPaintCell,
     onFillCells,
     onFillGrid,
+    filterRect,
+    filterSelecting = false,
+    onFilterRectChange,
+    onFilterSelectEnd,
   } = props;
 
   const canvasW = width * cellSize;
@@ -111,13 +121,34 @@ export default function GridCanvas(props: Props) {
   const traceSamplerRef = useRef<HTMLCanvasElement | null>(null);
   const [isPainting, setIsPainting] = useState(false);
   const [isLassoing, setIsLassoing] = useState(false);
+  const [hoverCell, setHoverCell] = useState<{ x: number; y: number } | null>(null);
+  const [filterPreviewRect, setFilterPreviewRect] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(
+    null
+  );
+  const filterDragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const focusCellRef = useRef<{ x: number; y: number } | null>(null);
+  const lastFocusTokenRef = useRef<number | undefined>(undefined);
+  const prevZoomRef = useRef(zoom);
+  const prevCellSizeRef = useRef(cellSize);
+  const prevBaseOffsetRef = useRef({ x: 0, y: 0 });
+  const prevPanRef = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    if (!filterSelecting && filterPreviewRect) {
+      setFilterPreviewRect(null);
+      filterDragStartRef.current = null;
+    }
+  }, [filterSelecting, filterPreviewRect]);
+  useEffect(() => {
+    focusCellRef.current = focusCell ?? null;
+  }, [focusCell]);
   const lastLassoPointRef = useRef<{ x: number; y: number } | null>(null);
   const lastPaintCellRef = useRef<{ x: number; y: number } | null>(null);
   const isTracingDragRef = useRef(false);
   const traceDragStartRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const traceResizeRef = useRef<
     | {
-        corner: "tl" | "tr" | "bl" | "br";
+        handle: "tl" | "tr" | "bl" | "br" | "tm" | "bm" | "ml" | "mr";
         startX: number;
         startY: number;
         startScale: number;
@@ -133,6 +164,37 @@ export default function GridCanvas(props: Props) {
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const stitchCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const stitchStyleVersion = 6;
+  const activeFilterRect =
+    filterSelecting && filterPreviewRect ? filterPreviewRect : filterRect ?? filterPreviewRect;
+
+  const normalizeRect = (start: { x: number; y: number }, end: { x: number; y: number }) => ({
+    x0: Math.min(start.x, end.x),
+    y0: Math.min(start.y, end.y),
+    x1: Math.max(start.x, end.x),
+    y1: Math.max(start.y, end.y),
+  });
+
+  const isCellInFilter = (x: number, y: number) =>
+    !activeFilterRect ||
+    (x >= activeFilterRect.x0 &&
+      x <= activeFilterRect.x1 &&
+      y >= activeFilterRect.y0 &&
+      y <= activeFilterRect.y1);
+
+  const isPointInFilter = (point: { x: number; y: number }) => {
+    if (!activeFilterRect) return true;
+    const cellX = Math.floor(point.x / cellSize);
+    const cellY = Math.floor(point.y / cellSize);
+    return isCellInFilter(cellX, cellY);
+  };
+
+  const updateHoverCell = (next: { x: number; y: number } | null) => {
+    setHoverCell((prev) => {
+      if (!next && !prev) return prev;
+      if (next && prev && next.x === prev.x && next.y === prev.y) return prev;
+      return next;
+    });
+  };
 
   function hexToRgb(hex: string) {
     const clean = hex.replace("#", "");
@@ -314,35 +376,90 @@ export default function GridCanvas(props: Props) {
     return canvas;
   }
 
+  const baseOffsetX = Math.max(0, (containerWidth - canvasW) / 2);
+  const baseOffsetY = Math.max(0, (containerHeight - canvasH) / 2);
+
   function clampPan(x: number, y: number) {
-    const extraX = containerWidth - canvasW;
-    const extraY = containerHeight - canvasH;
-    const maxX = extraX > 0 ? extraX / 2 : 0;
-    const maxY = extraY > 0 ? extraY / 2 : 0;
-    const minX = extraX > 0 ? -extraX / 2 : containerWidth - canvasW;
-    const minY = extraY > 0 ? -extraY / 2 : containerHeight - canvasH;
+    const edgeMinX = containerWidth - baseOffsetX - canvasW;
+    const edgeMaxX = -baseOffsetX;
+    const edgeMinY = containerHeight - baseOffsetY - canvasH;
+    const edgeMaxY = -baseOffsetY;
+    const baseOverscroll = Math.min(containerWidth, containerHeight) * 0.25;
+    const overscrollX = baseOverscroll + Math.max(0, baseOffsetY - baseOffsetX);
+    const overscrollY = baseOverscroll + Math.max(0, baseOffsetX - baseOffsetY);
+    const minX = Math.min(edgeMinX, edgeMaxX) - overscrollX;
+    const maxX = Math.max(edgeMinX, edgeMaxX) + overscrollX;
+    const minY = Math.min(edgeMinY, edgeMaxY) - overscrollY;
+    const maxY = Math.max(edgeMinY, edgeMaxY) + overscrollY;
     return {
       x: Math.max(minX, Math.min(maxX, x)),
       y: Math.max(minY, Math.min(maxY, y)),
     };
   }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    prevPanRef.current = panOffset;
+  }, [panOffset]);
+
+  useLayoutEffect(() => {
+    const prevZoom = prevZoomRef.current;
+    const prevCellSize = prevCellSizeRef.current;
+    const prevBase = prevBaseOffsetRef.current;
+    if (prevZoom !== zoom && Number.isFinite(prevCellSize) && prevCellSize > 0) {
+      const centerX = containerWidth / 2;
+      const centerY = containerHeight / 2;
+      const prevPan = prevPanRef.current;
+      const gridCenterX = (centerX - prevBase.x - prevPan.x) / prevCellSize;
+      const gridCenterY = (centerY - prevBase.y - prevPan.y) / prevCellSize;
+      if (Number.isFinite(gridCenterX) && Number.isFinite(gridCenterY)) {
+        const nextPanX = centerX - baseOffsetX - gridCenterX * cellSize;
+        const nextPanY = centerY - baseOffsetY - gridCenterY * cellSize;
+        setPanOffset(clampPan(nextPanX, nextPanY));
+      }
+    }
+    prevZoomRef.current = zoom;
+    prevCellSizeRef.current = cellSize;
+    prevBaseOffsetRef.current = { x: baseOffsetX, y: baseOffsetY };
+  }, [zoom, cellSize, containerWidth, containerHeight, baseOffsetX, baseOffsetY]);
+
+  useLayoutEffect(() => {
     setPanOffset((prev) => clampPan(prev.x, prev.y));
   }, [canvasW, canvasH, containerWidth, containerHeight]);
 
+  const lastCenterTokenRef = useRef<number | undefined>(undefined);
   useEffect(() => {
-    if (panToTopToken === undefined) return;
-    setPanOffset((prev) => clampPan(prev.x, 0));
-  }, [panToTopToken, canvasW, canvasH, containerWidth, containerHeight]);
+    if (centerCanvasToken === undefined) return;
+    if (centerCanvasToken === lastCenterTokenRef.current) return;
+    lastCenterTokenRef.current = centerCanvasToken;
+    setPanOffset(() => clampPan(0, 0));
+  }, [centerCanvasToken]);
+
+  useEffect(() => {
+    if (focusCellToken === undefined || focusCellToken === lastFocusTokenRef.current) return;
+    lastFocusTokenRef.current = focusCellToken;
+    const cell = focusCellRef.current;
+    if (!cell) return;
+    const targetX = containerWidth / 2 - baseOffsetX - (cell.x + 0.5) * cellSize;
+    const targetY = containerHeight / 2 - baseOffsetY - (cell.y + 0.5) * cellSize;
+    setPanOffset(() => clampPan(targetX, targetY));
+  }, [
+    focusCellToken,
+    cellSize,
+    containerWidth,
+    containerHeight,
+    baseOffsetX,
+    baseOffsetY,
+    canvasW,
+    canvasH,
+  ]);
+
   const pinchPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchStartDistanceRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef<number | null>(null);
+  const pinchLastCenterRef = useRef<{ x: number; y: number } | null>(null);
 
-  const panByCanvasX = canvasW <= containerWidth;
-  const panByCanvasY = canvasH <= containerHeight;
-  const drawTranslateX = panByCanvasX ? 0 : panOffset.x;
-  const drawTranslateY = panByCanvasY ? 0 : panOffset.y;
+  const drawTranslateX = baseOffsetX + panOffset.x;
+  const drawTranslateY = baseOffsetY + panOffset.y;
 
   const paletteRgb = useMemo(() => {
     const arr: Array<{ id: number; r: number; g: number; b: number }> = [];
@@ -368,21 +485,27 @@ export default function GridCanvas(props: Props) {
 
     // Crisp lines on high DPI screens
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(canvasW * dpr);
-    canvas.height = Math.floor(canvasH * dpr);
-    canvas.style.width = `${canvasW}px`;
-    canvas.style.height = `${canvasH}px`;
+    const surfaceW = containerWidth || canvasW;
+    const surfaceH = containerHeight || canvasH;
+    canvas.width = Math.floor(surfaceW * dpr);
+    canvas.height = Math.floor(surfaceH * dpr);
+    canvas.style.width = `${surfaceW}px`;
+    canvas.style.height = `${surfaceH}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Background
-    ctx.clearRect(0, 0, canvasW, canvasH);
-    ctx.fillStyle = darkCanvas ? "#000000" : threadView ? "#e6e6e6" : "#ffffff";
-    ctx.fillRect(0, 0, canvasW, canvasH);
+    ctx.clearRect(0, 0, surfaceW, surfaceH);
+    // Keep canvas transparent so overscroll reveals the container background.
 
     // Trace image (below cells)
     if (traceImage && traceOpacity > 0) {
       ctx.save();
       ctx.translate(drawTranslateX, drawTranslateY);
+      if (!traceAdjustMode) {
+        ctx.beginPath();
+        ctx.rect(0, 0, canvasW, canvasH);
+        ctx.clip();
+      }
       ctx.globalAlpha = Math.min(1, Math.max(0, traceOpacity));
       const drawW = traceImage.width * traceScale * zoom;
       const drawH = traceImage.height * traceScale * zoom;
@@ -423,7 +546,7 @@ export default function GridCanvas(props: Props) {
             ctx.fillStyle = contrastForHex(color.hex);
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";
-            ctx.font = `${Math.max(4, Math.floor(cellSize * 0.55))}px ui-sans-serif, system-ui, sans-serif`;
+            ctx.font = `700 ${Math.max(6, Math.floor(cellSize * 0.7))}px ui-sans-serif, system-ui, sans-serif`;
             ctx.fillText(symbol, centerX, centerY + 0.5);
             ctx.restore();
           }
@@ -436,22 +559,26 @@ export default function GridCanvas(props: Props) {
     if (showGridlines) {
       ctx.save();
       ctx.translate(drawTranslateX, drawTranslateY);
-      ctx.globalAlpha = gridAlpha;
+      ctx.globalAlpha = 1;
       ctx.strokeStyle = darkCanvas ? "rgba(255,255,255,0.35)" : "rgba(0,0,0,0.18)";
       ctx.lineWidth = 1;
+      const maxX = Math.max(0, canvasW - 0.5);
+      const maxY = Math.max(0, canvasH - 0.5);
 
       // Vertical lines
       for (let x = 0; x <= width; x++) {
+        const px = Math.min(maxX, Math.round(x * cellSize) + 0.5);
         ctx.beginPath();
-        ctx.moveTo(x * cellSize + 0.5, 0);
-        ctx.lineTo(x * cellSize + 0.5, canvasH);
+        ctx.moveTo(px, 0);
+        ctx.lineTo(px, canvasH);
         ctx.stroke();
       }
       // Horizontal lines
       for (let y = 0; y <= height; y++) {
+        const py = Math.min(maxY, Math.round(y * cellSize) + 0.5);
         ctx.beginPath();
-        ctx.moveTo(0, y * cellSize + 0.5);
-        ctx.lineTo(canvasW, y * cellSize + 0.5);
+        ctx.moveTo(0, py);
+        ctx.lineTo(canvasW, py);
         ctx.stroke();
       }
       ctx.restore();
@@ -500,6 +627,21 @@ export default function GridCanvas(props: Props) {
           drawIdentifyCell(x, y);
         }
       }
+      if (showSymbols) {
+        const symbol = symbolForColorId(identifyColorId, symbolMap);
+        if (symbol) {
+          ctx.fillStyle = "rgba(0,0,0,0.9)";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.font = `700 ${Math.max(6, Math.floor(cellSize * 0.7))}px ui-sans-serif, system-ui, sans-serif`;
+          for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+              if (grid[idx(x, y, width)] !== identifyColorId) continue;
+              ctx.fillText(symbol, x * cellSize + cellSize / 2, y * cellSize + cellSize / 2 + 0.5);
+            }
+          }
+        }
+      }
       ctx.restore();
     }
 
@@ -519,13 +661,17 @@ export default function GridCanvas(props: Props) {
       ctx.fillStyle = "rgba(255,255,255,0.9)";
       ctx.strokeStyle = "rgba(0,0,0,0.7)";
       const half = handleSize / 2;
-      const corners = [
+      const handles = [
         [x, y],
         [x + w, y],
         [x, y + h],
         [x + w, y + h],
+        [x + w / 2, y],
+        [x + w / 2, y + h],
+        [x, y + h / 2],
+        [x + w, y + h / 2],
       ];
-      corners.forEach(([cx, cy]) => {
+      handles.forEach(([cx, cy]) => {
         ctx.fillRect(cx - half, cy - half, handleSize, handleSize);
         ctx.strokeRect(cx - half, cy - half, handleSize, handleSize);
       });
@@ -548,6 +694,86 @@ export default function GridCanvas(props: Props) {
       ctx.stroke();
 
       ctx.restore();
+    }
+
+    if (hoverCell && (tool === "paint" || tool === "eraser") && !panMode && !traceAdjustMode) {
+      const size = Math.max(1, Math.floor(brushSize));
+      const radius = Math.floor(size / 2);
+      const startX = hoverCell.x - radius;
+      const startY = hoverCell.y - radius;
+      const endX = startX + size - 1;
+      const endY = startY + size - 1;
+      const clampedStartX = Math.max(0, startX);
+      const clampedStartY = Math.max(0, startY);
+      const clampedEndX = Math.min(width - 1, endX);
+      const clampedEndY = Math.min(height - 1, endY);
+      if (clampedStartX <= clampedEndX && clampedStartY <= clampedEndY) {
+        const x0 = Math.round(clampedStartX * cellSize);
+        const y0 = Math.round(clampedStartY * cellSize);
+        const x1 = Math.round((clampedEndX + 1) * cellSize);
+        const y1 = Math.round((clampedEndY + 1) * cellSize);
+        const previewW = x1 - x0;
+        const previewH = y1 - y0;
+        const color = paletteById.get(activeColorId);
+        let fill = "";
+        if (tool === "paint" && color) {
+          const rgb = hexToRgb(color.hex);
+          if (rgb) fill = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.25)`;
+        } else if (tool === "eraser") {
+          fill = darkCanvas ? "rgba(0,0,0,0.35)" : "rgba(255,255,255,0.5)";
+        }
+        ctx.save();
+        ctx.translate(drawTranslateX, drawTranslateY);
+        if (fill) {
+          ctx.fillStyle = fill;
+          ctx.fillRect(x0, y0, previewW, previewH);
+        }
+        ctx.strokeStyle = darkCanvas ? "rgba(255,255,255,0.9)" : "rgba(0,0,0,0.7)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+        ctx.strokeRect(
+          x0 + 0.5,
+          y0 + 0.5,
+          Math.max(0, previewW - 1),
+          Math.max(0, previewH - 1)
+        );
+        ctx.restore();
+      }
+    }
+
+    if (filterSelecting && !activeFilterRect) {
+      ctx.save();
+      ctx.translate(drawTranslateX, drawTranslateY);
+      ctx.fillStyle = "rgba(15, 23, 42, 0.35)";
+      ctx.fillRect(0, 0, canvasW, canvasH);
+      ctx.restore();
+    }
+
+    if (activeFilterRect) {
+      const x0 = Math.round(activeFilterRect.x0 * cellSize);
+      const y0 = Math.round(activeFilterRect.y0 * cellSize);
+      const x1 = Math.round((activeFilterRect.x1 + 1) * cellSize);
+      const y1 = Math.round((activeFilterRect.y1 + 1) * cellSize);
+      const w = x1 - x0;
+      const h = y1 - y0;
+      if (w > 0 && h > 0) {
+        ctx.save();
+        ctx.translate(drawTranslateX, drawTranslateY);
+        ctx.fillStyle = "rgba(15, 23, 42, 0.35)";
+        ctx.beginPath();
+        ctx.rect(0, 0, canvasW, canvasH);
+        ctx.rect(x0, y0, w, h);
+        ctx.fill("evenodd");
+        ctx.strokeStyle = "rgba(191, 100, 217, 0.95)";
+        ctx.lineWidth = 2;
+        if (filterSelecting) {
+          ctx.setLineDash([6, 4]);
+        } else {
+          ctx.setLineDash([]);
+        }
+        ctx.strokeRect(x0 + 1, y0 + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+        ctx.restore();
+      }
     }
   }, [
     width,
@@ -576,13 +802,30 @@ export default function GridCanvas(props: Props) {
     panOffset,
     showSymbols,
     identifyColorId,
+    hoverCell,
+    tool,
+    brushSize,
+    activeColorId,
+    panMode,
+    activeFilterRect,
+    filterSelecting,
   ]);
 
-  function getCellFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
+  function getCellFromEvent(e: React.PointerEvent<HTMLCanvasElement>, ignoreFilter = false) {
     const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
     const x = Math.floor((e.clientX - rect.left - drawTranslateX) / cellSize);
     const y = Math.floor((e.clientY - rect.top - drawTranslateY) / cellSize);
     if (x < 0 || y < 0 || x >= width || y >= height) return null;
+    if (!ignoreFilter && !isCellInFilter(x, y)) return null;
+    return { x, y };
+  }
+
+  function getClampedCellFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
+    const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+    const rawX = Math.floor((e.clientX - rect.left - drawTranslateX) / cellSize);
+    const rawY = Math.floor((e.clientY - rect.top - drawTranslateY) / cellSize);
+    const x = Math.max(0, Math.min(width - 1, rawX));
+    const y = Math.max(0, Math.min(height - 1, rawY));
     return { x, y };
   }
 
@@ -663,16 +906,27 @@ export default function GridCanvas(props: Props) {
   function updatePinchPointer(id: number, x: number, y: number) {
     pinchPointersRef.current.set(id, { x, y });
     if (pinchPointersRef.current.size === 2) {
+      pinchActiveRef.current = true;
       const points = Array.from(pinchPointersRef.current.values());
       const dx = points[0].x - points[1].x;
       const dy = points[0].y - points[1].y;
       const distance = Math.hypot(dx, dy);
+      const center = { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 };
       if (pinchStartDistanceRef.current === null) {
         pinchStartDistanceRef.current = distance;
         pinchStartZoomRef.current = zoom;
+        pinchLastCenterRef.current = center;
       } else if (pinchStartZoomRef.current !== null) {
         const nextZoom = clampZoom((pinchStartZoomRef.current * distance) / pinchStartDistanceRef.current);
         onZoomChange(nextZoom);
+        if (pinchLastCenterRef.current) {
+          const deltaX = center.x - pinchLastCenterRef.current.x;
+          const deltaY = center.y - pinchLastCenterRef.current.y;
+          if (deltaX !== 0 || deltaY !== 0) {
+            setPanOffset((prev) => clampPan(prev.x + deltaX, prev.y + deltaY));
+          }
+        }
+        pinchLastCenterRef.current = center;
       }
     }
   }
@@ -682,6 +936,7 @@ export default function GridCanvas(props: Props) {
     if (pinchPointersRef.current.size < 2) {
       pinchStartDistanceRef.current = null;
       pinchStartZoomRef.current = null;
+      pinchLastCenterRef.current = null;
     }
   }
 
@@ -720,12 +975,14 @@ export default function GridCanvas(props: Props) {
     for (let py = startY; py <= endY; py++) {
       for (let px = startX; px <= endX; px++) {
         if (px < 0 || py < 0 || px >= width || py >= height) continue;
+        if (!isCellInFilter(px, py)) continue;
         onPaintCell(px, py, colorId);
       }
     }
   }
 
   type FillResult = { next: Uint16Array; filled: boolean; indices?: number[] };
+  type FillBounds = { minX: number; maxX: number; minY: number; maxY: number };
 
   function scanlineFillSync(
     gridSnapshot: Uint16Array,
@@ -733,10 +990,18 @@ export default function GridCanvas(props: Props) {
     startY: number,
     targetColor: number,
     newColorId: number,
-    collectIndices: boolean
+    collectIndices: boolean,
+    bounds?: FillBounds
   ): FillResult {
     const w = width;
     const h = height;
+    const minX = bounds?.minX ?? 0;
+    const maxX = bounds?.maxX ?? w - 1;
+    const minY = bounds?.minY ?? 0;
+    const maxY = bounds?.maxY ?? h - 1;
+    if (startX < minX || startX > maxX || startY < minY || startY > maxY) {
+      return { next: new Uint16Array(gridSnapshot), filled: false };
+    }
     const next = new Uint16Array(gridSnapshot);
     const max = w * h;
     const stackX = new Int32Array(max);
@@ -749,10 +1014,10 @@ export default function GridCanvas(props: Props) {
     const indices: number[] | undefined = collectIndices ? [] : undefined;
 
     const scanRow = (ny: number, xL: number, xR: number) => {
-      if (ny < 0 || ny >= h) return;
+      if (ny < minY || ny > maxY) return;
       const row = ny * w;
-      let i = row + xL;
-      const end = row + xR;
+      let i = row + Math.max(minX, xL);
+      const end = row + Math.min(maxX, xR);
       while (i <= end) {
         if (next[i] === targetColor) {
           stackX[sp] = i - row;
@@ -770,15 +1035,15 @@ export default function GridCanvas(props: Props) {
       sp--;
       const x0 = stackX[sp];
       const y0 = stackY[sp];
-      if (x0 < 0 || x0 >= w || y0 < 0 || y0 >= h) continue;
+      if (x0 < minX || x0 > maxX || y0 < minY || y0 > maxY) continue;
       const row = y0 * w;
       if (next[row + x0] !== targetColor) continue;
 
       let xL = x0;
-      while (xL >= 0 && next[row + xL] === targetColor) xL--;
+      while (xL >= minX && next[row + xL] === targetColor) xL--;
       xL++;
       let xR = x0;
-      while (xR < w && next[row + xR] === targetColor) xR++;
+      while (xR <= maxX && next[row + xR] === targetColor) xR++;
       xR--;
 
       for (let x = xL; x <= xR; x++) {
@@ -802,10 +1067,18 @@ export default function GridCanvas(props: Props) {
     newColorId: number,
     collectIndices: boolean,
     token: number,
-    chunkSeedsPerFrame: number
+    chunkSeedsPerFrame: number,
+    bounds?: FillBounds
   ): Promise<FillResult | null> {
     const w = width;
     const h = height;
+    const minX = bounds?.minX ?? 0;
+    const maxX = bounds?.maxX ?? w - 1;
+    const minY = bounds?.minY ?? 0;
+    const maxY = bounds?.maxY ?? h - 1;
+    if (startX < minX || startX > maxX || startY < minY || startY > maxY) {
+      return { next: new Uint16Array(gridSnapshot), filled: false };
+    }
     const next = new Uint16Array(gridSnapshot);
     const max = w * h;
     const stackX = new Int32Array(max);
@@ -818,10 +1091,10 @@ export default function GridCanvas(props: Props) {
     const indices: number[] | undefined = collectIndices ? [] : undefined;
 
     const scanRow = (ny: number, xL: number, xR: number) => {
-      if (ny < 0 || ny >= h) return;
+      if (ny < minY || ny > maxY) return;
       const row = ny * w;
-      let i = row + xL;
-      const end = row + xR;
+      let i = row + Math.max(minX, xL);
+      const end = row + Math.min(maxX, xR);
       while (i <= end) {
         if (next[i] === targetColor) {
           stackX[sp] = i - row;
@@ -852,7 +1125,7 @@ export default function GridCanvas(props: Props) {
           sp--;
           const x0 = stackX[sp];
           const y0 = stackY[sp];
-          if (x0 < 0 || x0 >= w || y0 < 0 || y0 >= h) {
+          if (x0 < minX || x0 > maxX || y0 < minY || y0 > maxY) {
             processed++;
             continue;
           }
@@ -863,10 +1136,10 @@ export default function GridCanvas(props: Props) {
           }
 
           let xL = x0;
-          while (xL >= 0 && next[row + xL] === targetColor) xL--;
+          while (xL >= minX && next[row + xL] === targetColor) xL--;
           xL++;
           let xR = x0;
-          while (xR < w && next[row + xR] === targetColor) xR++;
+          while (xR <= maxX && next[row + xR] === targetColor) xR++;
           xR--;
 
           for (let x = xL; x <= xR; x++) {
@@ -901,6 +1174,9 @@ export default function GridCanvas(props: Props) {
     const maxCells = width * height;
     // Optional chunking for very large fills to keep the UI responsive.
     const shouldChunk = typeof requestAnimationFrame === "function" && maxCells > 240000;
+    const bounds = filterRect
+      ? { minX: filterRect.x0, maxX: filterRect.x1, minY: filterRect.y0, maxY: filterRect.y1 }
+      : undefined;
 
     const result = shouldChunk
       ? await scanlineFillChunked(
@@ -911,9 +1187,10 @@ export default function GridCanvas(props: Props) {
           newColorId,
           collectIndices,
           token,
-          1800
+          1800,
+          bounds
         )
-      : scanlineFillSync(gridSnapshot, startX, startY, targetColor, newColorId, collectIndices);
+      : scanlineFillSync(gridSnapshot, startX, startY, targetColor, newColorId, collectIndices, bounds);
 
     if (!result || !result.filled) return;
     if (fillTokenRef.current !== token) return;
@@ -927,6 +1204,7 @@ export default function GridCanvas(props: Props) {
   }
 
   function maybeAddLassoPoint(point: { x: number; y: number }) {
+    if (!isPointInFilter(point)) return;
     const last = lastLassoPointRef.current;
     if (!last) {
       lastLassoPointRef.current = point;
@@ -953,12 +1231,19 @@ export default function GridCanvas(props: Props) {
     if (near(point.x, point.y, x + w, y)) return "tr";
     if (near(point.x, point.y, x, y + h)) return "bl";
     if (near(point.x, point.y, x + w, y + h)) return "br";
+    const midX = x + w / 2;
+    const midY = y + h / 2;
+    if (near(point.x, point.y, midX, y)) return "tm";
+    if (near(point.x, point.y, midX, y + h)) return "bm";
+    if (near(point.x, point.y, x, midY)) return "ml";
+    if (near(point.x, point.y, x + w, midY)) return "mr";
     return null;
   }
 
-  const alignX = canvasW <= containerWidth ? "center" : "flex-start";
-  const alignY = alignTop ? "flex-start" : canvasH <= containerHeight ? "center" : "flex-start";
+  const alignX = "flex-start";
+  const alignY = "flex-start";
   const effectivePanMode = panMode && !(traceAdjustMode && traceImage);
+  const containerBg = darkCanvas ? "#000000" : threadView ? "#e6e6e6" : "#ffffff";
 
   return (
     <div
@@ -973,32 +1258,27 @@ export default function GridCanvas(props: Props) {
         height: containerHeight || canvasH,
         overflow: "hidden",
         borderRadius: 0,
-        background: "rgba(15,23,42,0.03)",
+        background: containerBg,
         boxShadow: "inset 0 0 0 1px rgba(15,23,42,0.15)",
         touchAction: "none",
       }}
     >
       <canvas
         ref={canvasRef}
-        height={canvasH}
-        width={canvasW}
         style={{
-          transform: `translate(${panByCanvasX ? panOffset.x : 0}px, ${panByCanvasY ? panOffset.y : 0}px)`,
           touchAction: "none",
           cursor:
-            effectivePanMode
-              ? "grab"
-              : traceAdjustMode && traceImage
+            filterSelecting
+              ? "crosshair"
+              : effectivePanMode
                 ? "grab"
-              : tool === "paint"
-              ? `url(${assetPath("/brush_cursor.cur")}) 0 31, auto`
-              : tool === "eraser"
-                ? `url(${assetPath("/eraser_cursor.cur")}) 0 31, auto`
-                : tool === "eyedropper"
-                  ? `url(${assetPath("/dropper_cursor.cur")}) 0 31, auto`
-                  : tool === "fill"
-                    ? "cell"
-                    : "auto",
+                : traceAdjustMode && traceImage
+                  ? "grab"
+                  : tool === "eyedropper"
+                    ? `url(${assetPath("/dropper_cursor.svg")}) 2 14, auto`
+                    : tool === "paint" || tool === "eraser"
+                      ? "crosshair"
+                      : "auto",
         }}
         onContextMenu={(e) => {
           e.preventDefault();
@@ -1007,6 +1287,20 @@ export default function GridCanvas(props: Props) {
           if (pinchEnabled && e.pointerType === "touch") {
             e.preventDefault();
             (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+          }
+          if (filterSelecting) {
+            e.preventDefault();
+            const cell = getClampedCellFromEvent(e);
+            if (!cell) return;
+            (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+            filterDragStartRef.current = cell;
+            setFilterPreviewRect({ x0: cell.x, y0: cell.y, x1: cell.x, y1: cell.y });
+            return;
+          }
+          if (tool === "paint" || tool === "eraser") {
+            updateHoverCell(getCellFromEvent(e));
+          } else {
+            updateHoverCell(null);
           }
           if (effectivePanMode || e.button === 2) {
             e.preventDefault();
@@ -1023,7 +1317,7 @@ export default function GridCanvas(props: Props) {
             (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
             if (handle) {
               traceResizeRef.current = {
-                corner: handle,
+                handle,
                 startX: traceOffsetX,
                 startY: traceOffsetY,
                 startScale: traceScale,
@@ -1087,6 +1381,7 @@ export default function GridCanvas(props: Props) {
           if (tool === "lasso") {
             if (pinchEnabled && pinchActiveRef.current) return;
             const point = getCanvasPoint(e);
+            if (!isPointInFilter(point)) return;
             if (lassoClosed && lassoPoints.length >= 3 && pointInPolygon(point, lassoPoints)) {
               onLassoFill(lassoPoints);
               return;
@@ -1101,6 +1396,30 @@ export default function GridCanvas(props: Props) {
           if (pinchEnabled && e.pointerType === "touch" && pinchPointersRef.current.size >= 2) {
             e.preventDefault();
           }
+          if (filterSelecting) {
+            if (filterDragStartRef.current) {
+              const cell = getClampedCellFromEvent(e);
+              setFilterPreviewRect(normalizeRect(filterDragStartRef.current, cell));
+            }
+            return;
+          }
+          if (tool === "paint" || tool === "eraser") {
+            if (
+              isPanningRef.current ||
+              traceResizeRef.current ||
+              isTracingDragRef.current ||
+              isLassoing ||
+              (pinchEnabled && pinchActiveRef.current) ||
+              panMode ||
+              traceAdjustMode
+            ) {
+              updateHoverCell(null);
+            } else {
+              updateHoverCell(getCellFromEvent(e));
+            }
+          } else if (hoverCell) {
+            updateHoverCell(null);
+          }
           if (isPanningRef.current && panDragStartRef.current) {
             const dx = e.clientX - panDragStartRef.current.x;
             const dy = e.clientY - panDragStartRef.current.y;
@@ -1112,14 +1431,14 @@ export default function GridCanvas(props: Props) {
             const point = getCanvasPoint(e);
             const px = point.x / zoom;
             const py = point.y / zoom;
-            const { corner, startX, startY, startScale, imgW, imgH } = traceResizeRef.current;
+            const { handle, startX, startY, startScale, imgW, imgH } = traceResizeRef.current;
             const baseW = imgW * startScale;
             const baseH = imgH * startScale;
             const minScale = 0.05;
             let nextScale = startScale;
             let nextX = startX;
             let nextY = startY;
-            if (corner === "tl") {
+            if (handle === "tl") {
               const brX = startX + baseW;
               const brY = startY + baseH;
               const sx = (brX - px) / imgW;
@@ -1127,7 +1446,7 @@ export default function GridCanvas(props: Props) {
               nextScale = Math.max(minScale, Math.min(sx, sy));
               nextX = brX - imgW * nextScale;
               nextY = brY - imgH * nextScale;
-            } else if (corner === "tr") {
+            } else if (handle === "tr") {
               const blX = startX;
               const blY = startY + baseH;
               const sx = (px - blX) / imgW;
@@ -1135,7 +1454,7 @@ export default function GridCanvas(props: Props) {
               nextScale = Math.max(minScale, Math.min(sx, sy));
               nextX = blX;
               nextY = blY - imgH * nextScale;
-            } else if (corner === "bl") {
+            } else if (handle === "bl") {
               const trX = startX + baseW;
               const trY = startY;
               const sx = (trX - px) / imgW;
@@ -1143,7 +1462,7 @@ export default function GridCanvas(props: Props) {
               nextScale = Math.max(minScale, Math.min(sx, sy));
               nextX = trX - imgW * nextScale;
               nextY = trY;
-            } else if (corner === "br") {
+            } else if (handle === "br") {
               const tlX = startX;
               const tlY = startY;
               const sx = (px - tlX) / imgW;
@@ -1151,6 +1470,42 @@ export default function GridCanvas(props: Props) {
               nextScale = Math.max(minScale, Math.min(sx, sy));
               nextX = tlX;
               nextY = tlY;
+            } else if (handle === "tm") {
+              const anchorX = startX + baseW / 2;
+              const anchorY = startY + baseH;
+              const rawH = anchorY - py;
+              const nextH = Math.max(imgH * minScale, rawH);
+              const nextW = (nextH * imgW) / imgH;
+              nextScale = nextW / imgW;
+              nextX = anchorX - nextW / 2;
+              nextY = anchorY - nextH;
+            } else if (handle === "bm") {
+              const anchorX = startX + baseW / 2;
+              const anchorY = startY;
+              const rawH = py - anchorY;
+              const nextH = Math.max(imgH * minScale, rawH);
+              const nextW = (nextH * imgW) / imgH;
+              nextScale = nextW / imgW;
+              nextX = anchorX - nextW / 2;
+              nextY = anchorY;
+            } else if (handle === "ml") {
+              const anchorX = startX + baseW;
+              const anchorY = startY + baseH / 2;
+              const rawW = anchorX - px;
+              const nextW = Math.max(imgW * minScale, rawW);
+              const nextH = (nextW * imgH) / imgW;
+              nextScale = nextW / imgW;
+              nextX = anchorX - nextW;
+              nextY = anchorY - nextH / 2;
+            } else if (handle === "mr") {
+              const anchorX = startX;
+              const anchorY = startY + baseH / 2;
+              const rawW = px - anchorX;
+              const nextW = Math.max(imgW * minScale, rawW);
+              const nextH = (nextW * imgH) / imgW;
+              nextScale = nextW / imgW;
+              nextX = anchorX;
+              nextY = anchorY - nextH / 2;
             }
             onTraceScaleChange(nextScale);
             onTraceOffsetChange(nextX, nextY);
@@ -1183,7 +1538,16 @@ export default function GridCanvas(props: Props) {
           }
           lastPaintCellRef.current = cell;
         }}
-        onPointerUp={() => {
+        onPointerUp={(e) => {
+          if (filterSelecting && filterDragStartRef.current) {
+            const endPoint = getClampedCellFromEvent(e);
+            const rect = normalizeRect(filterDragStartRef.current, endPoint);
+            filterDragStartRef.current = null;
+            setFilterPreviewRect(null);
+            onFilterRectChange?.(rect);
+            onFilterSelectEnd?.();
+            return;
+          }
           if (isPanningRef.current) {
             isPanningRef.current = false;
             panDragStartRef.current = null;
@@ -1208,7 +1572,16 @@ export default function GridCanvas(props: Props) {
           lastPaintCellRef.current = null;
           onStrokeEnd();
         }}
-        onPointerCancel={() => {
+        onPointerCancel={(e) => {
+          if (filterSelecting && filterDragStartRef.current) {
+            const endPoint = getClampedCellFromEvent(e);
+            const rect = normalizeRect(filterDragStartRef.current, endPoint);
+            filterDragStartRef.current = null;
+            setFilterPreviewRect(null);
+            onFilterRectChange?.(rect);
+            onFilterSelectEnd?.();
+            return;
+          }
           if (isPanningRef.current) {
             isPanningRef.current = false;
             panDragStartRef.current = null;
@@ -1232,6 +1605,12 @@ export default function GridCanvas(props: Props) {
           setIsPainting(false);
           lastPaintCellRef.current = null;
           onStrokeEnd();
+        }}
+        onPointerLeave={() => {
+          if (filterSelecting) {
+            return;
+          }
+          updateHoverCell(null);
         }}
         onPointerUpCapture={(e) => {
           if (!pinchEnabled || e.pointerType !== "touch") return;

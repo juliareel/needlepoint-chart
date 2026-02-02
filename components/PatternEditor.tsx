@@ -14,6 +14,20 @@ const DEFAULT_PALETTE: Color[] = DMC_COLORS;
 const EXPORT_CELL_SIZE = 24;
 
 type Point = { x: number; y: number };
+type FilterRect = { x0: number; y0: number; x1: number; y1: number };
+
+function clampFilterRect(rect: FilterRect, width: number, height: number): FilterRect {
+  const x0 = Math.max(0, Math.min(width - 1, rect.x0));
+  const y0 = Math.max(0, Math.min(height - 1, rect.y0));
+  const x1 = Math.max(0, Math.min(width - 1, rect.x1));
+  const y1 = Math.max(0, Math.min(height - 1, rect.y1));
+  return {
+    x0: Math.min(x0, x1),
+    y0: Math.min(y0, y1),
+    x1: Math.max(x0, x1),
+    y1: Math.max(y0, y1),
+  };
+}
 
 function pointInPolygon(point: Point, polygon: Point[]) {
   let inside = false;
@@ -404,6 +418,15 @@ export default function PatternEditor() {
   const [threadView, setThreadView] = useState(false);
   const [darkCanvas, setDarkCanvas] = useState(false);
   const [showSymbols, setShowSymbols] = useState(false);
+  const [filterMode, setFilterMode] = useState(false);
+  const [filterRect, setFilterRect] = useState<FilterRect | null>(null);
+  const [filterSelecting, setFilterSelecting] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    position?: { top: number; left: number } | null;
+  } | null>(null);
   const [gridOpen, setGridOpen] = useState(true);
   const [traceOpen, setTraceOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(true);
@@ -445,9 +468,15 @@ export default function PatternEditor() {
   const [remapMode, setRemapMode] = useState(false);
   const [remapSourceId, setRemapSourceId] = useState<number | null>(null);
   const [remapTargetId, setRemapTargetId] = useState<number | null>(null);
-  const [identifyMode, setIdentifyMode] = useState(false);
   const [identifyColorId, setIdentifyColorId] = useState<number | null>(null);
+  const [mergeMode, setMergeMode] = useState(false);
+  const [mergeSelectedIds, setMergeSelectedIds] = useState<number[]>([]);
+  const [mergeTargetId, setMergeTargetId] = useState<number | null>(null);
+  const [deleteMode, setDeleteMode] = useState(false);
+  const [deleteSelectedIds, setDeleteSelectedIds] = useState<number[]>([]);
   const draftInputRef = useRef<HTMLInputElement | null>(null);
+  const clearButtonRef = useRef<HTMLButtonElement | null>(null);
+  const confirmActionRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (isNarrow) {
@@ -456,12 +485,16 @@ export default function PatternEditor() {
     }
   }, [isNarrow]);
   const remapOriginalRef = useRef<Uint16Array | null>(null);
+  const mergeOriginalRef = useRef<Uint16Array | null>(null);
+  const deleteOriginalRef = useRef<Uint16Array | null>(null);
 
   const [zoom, setZoom] = useState(1);
   const [canvasControlsHeight, setCanvasControlsHeight] = useState(0);
   const minZoom = 0.25;
-  const maxZoom = isNarrow ? 8 : 4;
+  const maxZoom = isNarrow ? 12 : 8;
   const [showGridlines, setShowGridlines] = useState(true);
+  const [lastEditCell, setLastEditCell] = useState<{ x: number; y: number } | null>(null);
+  const [jumpToLastEditTick, setJumpToLastEditTick] = useState(0);
 
   const [grid, setGrid] = useState<Uint16Array>(() => makeGrid(gridW, gridH, 0));
   const canvasAreaRef = useRef<HTMLDivElement | null>(null);
@@ -470,6 +503,48 @@ export default function PatternEditor() {
   useEffect(() => {
     gridRef.current = grid;
   }, [grid]);
+
+  useEffect(() => {
+    if (!filterMode && filterSelecting) {
+      setFilterSelecting(false);
+    }
+  }, [filterMode, filterSelecting]);
+
+  useEffect(() => {
+    if (!filterRect) return;
+    if (gridW <= 0 || gridH <= 0) return;
+    const clamped = clampFilterRect(filterRect, gridW, gridH);
+    if (
+      clamped.x0 !== filterRect.x0 ||
+      clamped.y0 !== filterRect.y0 ||
+      clamped.x1 !== filterRect.x1 ||
+      clamped.y1 !== filterRect.y1
+    ) {
+      setFilterRect(clamped);
+    }
+  }, [filterRect, gridW, gridH]);
+
+  const activeFilterRect = useMemo(() => {
+    if (!filterMode || !filterRect) return null;
+    return clampFilterRect(filterRect, gridW, gridH);
+  }, [filterMode, filterRect, gridW, gridH]);
+  const isCellInFilter = (x: number, y: number) =>
+    !activeFilterRect ||
+    (x >= activeFilterRect.x0 &&
+      x <= activeFilterRect.x1 &&
+      y >= activeFilterRect.y0 &&
+      y <= activeFilterRect.y1);
+  const isIndexInFilter = (cellIdx: number) => {
+    if (!activeFilterRect) return true;
+    const x = cellIdx % gridW;
+    const y = Math.floor(cellIdx / gridW);
+    return (
+      x >= activeFilterRect.x0 &&
+      x <= activeFilterRect.x1 &&
+      y >= activeFilterRect.y0 &&
+      y <= activeFilterRect.y1
+    );
+  };
 
   useEffect(() => {
     if (!traceImageUrl) {
@@ -865,11 +940,11 @@ export default function PatternEditor() {
         const checkNeighbor = (nx: number, ny: number) => {
           if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) return;
           const nIdx = idx(nx, ny, gridW);
-        const nId = cleaned[nIdx];
-        if (nId === colorId) {
-          if (!visited[nIdx]) {
-            visited[nIdx] = 1;
-            stack[sp++] = nIdx;
+          const nId = cleaned[nIdx];
+          if (nId === colorId) {
+            if (!visited[nIdx]) {
+              visited[nIdx] = 1;
+              stack[sp++] = nIdx;
             }
           } else {
             neighborCounts.set(nId, (neighborCounts.get(nId) ?? 0) + 1);
@@ -1091,9 +1166,11 @@ export default function PatternEditor() {
 
   // Paint updates (immutable-ish: copy Uint16Array)
   function onPaintCell(x: number, y: number, colorId: number) {
+    if (!isCellInFilter(x, y)) return;
     const currentGrid = gridRef.current ?? grid;
     const cellIdx = idx(x, y, gridW);
     if (currentGrid[cellIdx] === colorId) return;
+    setLastEditCell({ x, y });
     if (strokeActiveRef.current) {
       strokeDirtyRef.current = true;
     }
@@ -1106,14 +1183,25 @@ export default function PatternEditor() {
   }
 
   function onFillCells(indices: number[], colorId: number) {
-    if (indices.length === 0) return;
+    const filtered = activeFilterRect ? indices.filter((i) => isIndexInFilter(i)) : indices;
+    if (filtered.length === 0) return;
+    let sumX = 0;
+    let sumY = 0;
+    for (const i of filtered) {
+      sumX += i % gridW;
+      sumY += Math.floor(i / gridW);
+    }
+    setLastEditCell({
+      x: Math.round(sumX / filtered.length),
+      y: Math.round(sumY / filtered.length),
+    });
     if (strokeActiveRef.current) {
       strokeDirtyRef.current = true;
     }
     const version = strokeVersionRef.current;
     updateGrid((prev) => {
       const next = new Uint16Array(prev);
-      for (const i of indices) {
+      for (const i of filtered) {
         next[i] = colorId;
       }
       return next;
@@ -1123,6 +1211,15 @@ export default function PatternEditor() {
   function onFillGrid(nextGrid: Uint16Array) {
     if (strokeActiveRef.current) {
       strokeDirtyRef.current = true;
+    }
+    if (nextGrid.length === gridW * gridH) {
+      const prev = gridRef.current ?? grid;
+      for (let i = 0; i < nextGrid.length; i++) {
+        if (nextGrid[i] !== prev[i]) {
+          setLastEditCell({ x: i % gridW, y: Math.floor(i / gridW) });
+          break;
+        }
+      }
     }
     const version = strokeVersionRef.current;
     updateGrid(() => nextGrid, version);
@@ -1178,10 +1275,13 @@ export default function PatternEditor() {
 
   function confirmAndApplyGrid() {
     if (hasPaintedCells()) {
-      const ok = window.confirm(
-        "Changing the grid size will clear your current stitches. Do you want to continue?"
-      );
-      if (!ok) return;
+      openConfirmDialog({
+        title: "Change canvas size?",
+        message: "Changing the grid size will clear your current stitches. Do you want to continue?",
+        confirmLabel: "Continue",
+        onConfirm: applyDraftGrid,
+      });
+      return;
     }
     applyDraftGrid();
   }
@@ -1190,10 +1290,14 @@ export default function PatternEditor() {
     if (!traceImage) return;
     if (traceLocked) {
       if (hasPaintedCells()) {
-        const ok = window.confirm(
-          "Unlocking the trace image after painting may misalign it with your stitches. Do you want to continue?"
-        );
-        if (!ok) return;
+        openConfirmDialog({
+          title: "Unlock trace image?",
+          message:
+            "Unlocking the trace image after painting may misalign it with your stitches. Do you want to continue?",
+          confirmLabel: "Unlock",
+          onConfirm: () => setTraceLocked(false),
+        });
+        return;
       }
       setTraceLocked(false);
       return;
@@ -1205,22 +1309,62 @@ export default function PatternEditor() {
     if (!traceImage) return;
     if (!nextLocked && traceLocked) {
       if (hasPaintedCells()) {
-        const ok = window.confirm(
-          "Unlocking the background image after painting may misalign it with your stitches. Do you want to continue?"
-        );
-        if (!ok) return;
+        openConfirmDialog({
+          title: "Unlock background image?",
+          message:
+            "Unlocking the background image after painting may misalign it with your stitches. Do you want to continue?",
+          confirmLabel: "Unlock",
+          onConfirm: () => setTraceLocked(nextLocked),
+        });
+        return;
       }
     }
     setTraceLocked(nextLocked);
   }
 
-  function clearGrid() {
-    if (hasPaintedCells()) {
-      const ok = window.confirm("This will clear all painted cells. Do you want to continue?");
-      if (!ok) return;
-    }
+  function performClearGrid() {
     bumpStrokeVersion();
     updateGrid(() => makeGrid(gridW, gridH, 0));
+  }
+
+  function clearGrid() {
+    if (hasPaintedCells()) {
+      openConfirmDialog({
+        title: "Clear canvas?",
+        message: "This will clear all painted cells. This action can be undone.",
+        confirmLabel: "Clear",
+        onConfirm: performClearGrid,
+        anchorRef: clearButtonRef,
+      });
+      return;
+    }
+    performClearGrid();
+  }
+
+  function openConfirmDialog(opts: {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+    anchorRef?: React.RefObject<HTMLElement | null>;
+  }) {
+    const { title, message, confirmLabel, onConfirm, anchorRef } = opts;
+    confirmActionRef.current = onConfirm;
+    let position: { top: number; left: number } | null = null;
+    if (anchorRef?.current && typeof window !== "undefined") {
+      const rect = anchorRef.current.getBoundingClientRect();
+      const margin = 12;
+      const panelW = Math.min(360, window.innerWidth - margin * 2);
+      const panelH = 150;
+      const centerLeft = rect.left + rect.width / 2 - panelW / 2;
+      const left = Math.min(Math.max(centerLeft, margin), window.innerWidth - panelW - margin);
+      let top = rect.bottom + 8;
+      if (top + panelH > window.innerHeight - margin) {
+        top = Math.max(margin, rect.top - panelH - 8);
+      }
+      position = { top, left };
+    }
+    setConfirmDialog({ title, message, confirmLabel, position });
   }
 
   function undo() {
@@ -1290,8 +1434,13 @@ export default function PatternEditor() {
     updateGrid((prev) => {
       const next = new Uint16Array(prev);
       let changed = false;
+      let minX = gridW;
+      let minY = gridH;
+      let maxX = 0;
+      let maxY = 0;
       for (let y = 0; y < gridH; y++) {
         for (let x = 0; x < gridW; x++) {
+          if (!isCellInFilter(x, y)) continue;
           const cx = (x + 0.5) * displayCellSize;
           const cy = (y + 0.5) * displayCellSize;
           if (!pointInPolygon({ x: cx, y: cy }, points)) continue;
@@ -1299,7 +1448,17 @@ export default function PatternEditor() {
           if (next[cellIdx] === activeColorId) continue;
           next[cellIdx] = activeColorId;
           changed = true;
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
         }
+      }
+      if (changed) {
+        setLastEditCell({
+          x: Math.round((minX + maxX) / 2),
+          y: Math.round((minY + maxY) / 2),
+        });
       }
       return changed ? next : prev;
     });
@@ -1393,6 +1552,7 @@ export default function PatternEditor() {
       const next = new Uint16Array(prev);
       let changed = false;
       for (let i = 0; i < next.length; i++) {
+        if (!isIndexInFilter(i)) continue;
         if (next[i] === sourceId) {
           next[i] = targetId;
           changed = true;
@@ -1418,6 +1578,7 @@ export default function PatternEditor() {
     setGrid(() => {
       const next = new Uint16Array(original);
       for (let i = 0; i < next.length; i++) {
+        if (!isIndexInFilter(i)) continue;
         if (next[i] === remapSourceId) next[i] = targetId;
       }
       return next;
@@ -1433,31 +1594,88 @@ export default function PatternEditor() {
     setRemapTargetId(null);
   }
 
+  function cancelMerge() {
+    if (mergeOriginalRef.current) {
+      setGrid(mergeOriginalRef.current);
+    }
+    mergeOriginalRef.current = null;
+    setMergeSelectedIds([]);
+    setMergeTargetId(null);
+  }
+
+  function cancelDelete() {
+    if (deleteOriginalRef.current) {
+      setGrid(deleteOriginalRef.current);
+    }
+    deleteOriginalRef.current = null;
+    setDeleteSelectedIds([]);
+  }
+
   function toggleRemapMode() {
     if (remapMode) {
       cancelRemap();
       setRemapMode(false);
       return;
     }
-    if (identifyMode) {
-      setIdentifyMode(false);
-      setIdentifyColorId(null);
+    if (mergeMode) {
+      cancelMerge();
+      setMergeMode(false);
+    }
+    if (deleteMode) {
+      cancelDelete();
+      setDeleteMode(false);
     }
     cancelRemap();
     setRemapMode(true);
   }
 
-  function toggleIdentifyMode() {
-    if (identifyMode) {
-      setIdentifyMode(false);
-      setIdentifyColorId(null);
+  function toggleMergeMode() {
+    if (mergeMode) {
+      cancelMerge();
+      setMergeMode(false);
       return;
     }
     if (remapMode) {
       cancelRemap();
       setRemapMode(false);
     }
-    setIdentifyMode(true);
+    if (deleteMode) {
+      cancelDelete();
+      setDeleteMode(false);
+    }
+    cancelMerge();
+    mergeOriginalRef.current = new Uint16Array(grid);
+    setMergeMode(true);
+  }
+
+  function toggleDeleteMode() {
+    if (deleteMode) {
+      cancelDelete();
+      setDeleteMode(false);
+      return;
+    }
+    if (remapMode) {
+      cancelRemap();
+      setRemapMode(false);
+    }
+    if (mergeMode) {
+      cancelMerge();
+      setMergeMode(false);
+    }
+    cancelDelete();
+    deleteOriginalRef.current = new Uint16Array(grid);
+    setDeleteMode(true);
+  }
+
+  function startFilterSelection() {
+    setFilterMode(true);
+    setFilterSelecting(true);
+  }
+
+  function clearFilterSelection() {
+    setFilterRect(null);
+    setFilterSelecting(false);
+    setFilterMode(false);
   }
 
   function confirmRemap() {
@@ -1469,13 +1687,23 @@ export default function PatternEditor() {
     bumpStrokeVersion();
     pushHistory({ gridW, gridH, grid: original });
     setFutureState([]);
+    let focusCell: { x: number; y: number } | null = null;
     setGrid(() => {
       const next = new Uint16Array(original);
       for (let i = 0; i < next.length; i++) {
-        if (next[i] === remapSourceId) next[i] = remapTargetId;
+        if (!isIndexInFilter(i)) continue;
+        if (next[i] === remapSourceId) {
+          next[i] = remapTargetId;
+          if (focusCell == null) {
+            focusCell = { x: i % gridW, y: Math.floor(i / gridW) };
+          }
+        }
       }
       return next;
     });
+    if (focusCell) {
+      setLastEditCell(focusCell);
+    }
     setActiveColorId(remapTargetId);
     remapOriginalRef.current = null;
     setRemapSourceId(null);
@@ -1483,30 +1711,287 @@ export default function PatternEditor() {
     setRemapMode(false);
   }
 
+  function confirmMerge() {
+    if (mergeSelectedIds.length < 2 || mergeTargetId === null || !mergeSelectedIds.includes(mergeTargetId)) {
+      return;
+    }
+    const targetId = mergeTargetId;
+    const sourceIds = mergeSelectedIds.filter((id) => id !== targetId);
+    if (sourceIds.length === 0) return;
+    const sourceSet = new Set(sourceIds);
+    const original = mergeOriginalRef.current ?? new Uint16Array(grid);
+    mergeOriginalRef.current = original;
+    bumpStrokeVersion();
+    pushHistory({ gridW, gridH, grid: original });
+    setFutureState([]);
+    let focusCell: { x: number; y: number } | null = null;
+    setGrid((prev) => {
+      const next = new Uint16Array(original);
+      let changed = false;
+      for (let i = 0; i < next.length; i++) {
+        if (!isIndexInFilter(i)) continue;
+        if (sourceSet.has(next[i])) {
+          next[i] = targetId;
+          changed = true;
+          if (!focusCell) {
+            focusCell = { x: i % gridW, y: Math.floor(i / gridW) };
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+    if (focusCell) {
+      setLastEditCell(focusCell);
+    }
+    setActiveColorId(targetId);
+    mergeOriginalRef.current = null;
+    setMergeSelectedIds([]);
+    setMergeTargetId(null);
+    setMergeMode(false);
+  }
+
+  function confirmDeleteColors() {
+    if (deleteSelectedIds.length === 0) return;
+    const availableIds = usedColorIds.filter((id) => !deleteSelectedIds.includes(id));
+    if (availableIds.length === 0) return;
+
+    const toLab = (id: number) => {
+      const color = paletteById.get(id);
+      if (!color) return null;
+      const clean = color.hex.replace("#", "");
+      if (clean.length !== 6) return null;
+      const r = parseInt(clean.slice(0, 2), 16) / 255;
+      const g = parseInt(clean.slice(2, 4), 16) / 255;
+      const b = parseInt(clean.slice(4, 6), 16) / 255;
+      if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+      return rgbToOklab(r, g, b);
+    };
+
+    const candidateLabs = availableIds
+      .map((id) => {
+        const lab = toLab(id);
+        if (!lab) return null;
+        return { id, L: lab.L, A: lab.A, B: lab.B };
+      })
+      .filter((entry): entry is { id: number; L: number; A: number; B: number } => Boolean(entry));
+
+    const fallbackId = candidateLabs[0]?.id ?? availableIds[0];
+    if (fallbackId == null) return;
+
+    const replacementById = new Map<number, number>();
+    for (const id of deleteSelectedIds) {
+      const lab = toLab(id);
+      if (!lab || candidateLabs.length === 0) {
+        replacementById.set(id, fallbackId);
+        continue;
+      }
+      let bestId = fallbackId;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (const candidate of candidateLabs) {
+        const dx = lab.L - candidate.L;
+        const dy = lab.A - candidate.A;
+        const dz = lab.B - candidate.B;
+        const dist = dx * dx + dy * dy + dz * dz;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestId = candidate.id;
+        }
+      }
+      replacementById.set(id, bestId);
+    }
+
+    const original = deleteOriginalRef.current ?? new Uint16Array(grid);
+    deleteOriginalRef.current = original;
+    bumpStrokeVersion();
+    pushHistory({ gridW, gridH, grid: original });
+    setFutureState([]);
+    let focusCell: { x: number; y: number } | null = null;
+    setGrid((prev) => {
+      const next = new Uint16Array(original);
+      let changed = false;
+      for (let i = 0; i < next.length; i++) {
+        if (!isIndexInFilter(i)) continue;
+        const replacement = replacementById.get(next[i]);
+        if (replacement != null) {
+          next[i] = replacement;
+          changed = true;
+          if (!focusCell) {
+            focusCell = { x: i % gridW, y: Math.floor(i / gridW) };
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+    if (focusCell) {
+      setLastEditCell(focusCell);
+    }
+    if (replacementById.has(activeColorId)) {
+      setActiveColorId(replacementById.get(activeColorId) ?? activeColorId);
+    }
+    deleteOriginalRef.current = null;
+    setDeleteSelectedIds([]);
+    setDeleteMode(false);
+  }
+
+  const usedColorsGrid =
+    remapMode && remapOriginalRef.current
+      ? remapOriginalRef.current
+      : mergeMode && mergeOriginalRef.current
+        ? mergeOriginalRef.current
+        : deleteMode && deleteOriginalRef.current
+          ? deleteOriginalRef.current
+          : grid;
   const usedColors = useMemo(() => {
-    const sourceGrid =
-      remapMode && remapSourceId !== null && remapOriginalRef.current ? remapOriginalRef.current : grid;
     const counts = new Map<number, number>();
-    for (let i = 0; i < sourceGrid.length; i++) {
-      const id = sourceGrid[i];
-      if (id === 0) continue;
-      counts.set(id, (counts.get(id) || 0) + 1);
+    if (activeFilterRect) {
+      for (let y = activeFilterRect.y0; y <= activeFilterRect.y1; y++) {
+        for (let x = activeFilterRect.x0; x <= activeFilterRect.x1; x++) {
+          const id = usedColorsGrid[idx(x, y, gridW)];
+          if (id === 0) continue;
+          counts.set(id, (counts.get(id) || 0) + 1);
+        }
+      }
+    } else {
+      for (let i = 0; i < usedColorsGrid.length; i++) {
+        const id = usedColorsGrid[i];
+        if (id === 0) continue;
+        counts.set(id, (counts.get(id) || 0) + 1);
+      }
     }
     const arr = Array.from(counts.entries())
       .map(([id, count]) => ({ color: paletteById.get(id)!, count }))
       .filter((x) => Boolean(x.color))
       .sort((a, b) => b.count - a.count);
     return arr;
-  }, [grid, paletteById, remapMode, remapSourceId]);
+  }, [usedColorsGrid, paletteById, activeFilterRect, gridW]);
   const usedColorIds = useMemo(() => usedColors.map((entry) => entry.color.id), [usedColors]);
-  const symbolMap = useMemo(() => {
-    const map = new Map<number, string>();
-    usedColors.forEach((entry, index) => {
-      const symbol = SYMBOLS[index % SYMBOLS.length] ?? "";
-      if (symbol) map.set(entry.color.id, symbol);
+  const [symbolMap, setSymbolMap] = useState<Map<number, string>>(() => new Map());
+  useEffect(() => {
+    if (usedColors.length === 0) return;
+    setSymbolMap((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      const usedSymbols = new Set(next.values());
+      for (const entry of usedColors) {
+        const id = entry.color.id;
+        if (next.has(id)) continue;
+        const symbol = SYMBOLS.find((value) => value && !usedSymbols.has(value)) ?? "";
+        if (symbol) {
+          next.set(id, symbol);
+          usedSymbols.add(symbol);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
     });
-    return map;
   }, [usedColors]);
+  useEffect(() => {
+    setMergeSelectedIds((prev) => prev.filter((id) => usedColorIds.includes(id)));
+  }, [usedColorIds]);
+  useEffect(() => {
+    if (mergeTargetId !== null && !usedColorIds.includes(mergeTargetId)) {
+      setMergeTargetId(null);
+    }
+  }, [mergeTargetId, usedColorIds]);
+  useEffect(() => {
+    setDeleteSelectedIds((prev) => prev.filter((id) => usedColorIds.includes(id)));
+  }, [usedColorIds]);
+
+  useEffect(() => {
+    if (!mergeMode) return;
+    const original = mergeOriginalRef.current;
+    if (!original) return;
+    if (mergeSelectedIds.length < 2 || mergeTargetId === null || !mergeSelectedIds.includes(mergeTargetId)) {
+      setGrid(original);
+      return;
+    }
+    const targetId = mergeTargetId;
+    const sourceSet = new Set(mergeSelectedIds.filter((id) => id !== targetId));
+    if (sourceSet.size === 0) {
+      setGrid(original);
+      return;
+    }
+    setGrid(() => {
+      const next = new Uint16Array(original);
+      for (let i = 0; i < next.length; i++) {
+        if (!isIndexInFilter(i)) continue;
+        if (sourceSet.has(next[i])) {
+          next[i] = targetId;
+        }
+      }
+      return next;
+    });
+  }, [mergeMode, mergeSelectedIds, mergeTargetId, activeFilterRect, gridW]);
+
+  useEffect(() => {
+    if (!deleteMode) return;
+    const original = deleteOriginalRef.current;
+    if (!original) return;
+    if (deleteSelectedIds.length === 0) {
+      setGrid(original);
+      return;
+    }
+    const availableIds = usedColorIds.filter((id) => !deleteSelectedIds.includes(id));
+    if (availableIds.length === 0) {
+      setGrid(original);
+      return;
+    }
+    const toLab = (id: number) => {
+      const color = paletteById.get(id);
+      if (!color) return null;
+      const clean = color.hex.replace("#", "");
+      if (clean.length !== 6) return null;
+      const r = parseInt(clean.slice(0, 2), 16) / 255;
+      const g = parseInt(clean.slice(2, 4), 16) / 255;
+      const b = parseInt(clean.slice(4, 6), 16) / 255;
+      if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+      return rgbToOklab(r, g, b);
+    };
+    const candidateLabs = availableIds
+      .map((id) => {
+        const lab = toLab(id);
+        if (!lab) return null;
+        return { id, L: lab.L, A: lab.A, B: lab.B };
+      })
+      .filter((entry): entry is { id: number; L: number; A: number; B: number } => Boolean(entry));
+    const fallbackId = candidateLabs[0]?.id ?? availableIds[0];
+    if (fallbackId == null) {
+      setGrid(original);
+      return;
+    }
+    const replacementById = new Map<number, number>();
+    for (const id of deleteSelectedIds) {
+      const lab = toLab(id);
+      if (!lab || candidateLabs.length === 0) {
+        replacementById.set(id, fallbackId);
+        continue;
+      }
+      let bestId = fallbackId;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (const candidate of candidateLabs) {
+        const dx = lab.L - candidate.L;
+        const dy = lab.A - candidate.A;
+        const dz = lab.B - candidate.B;
+        const dist = dx * dx + dy * dy + dz * dz;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestId = candidate.id;
+        }
+      }
+      replacementById.set(id, bestId);
+    }
+    setGrid(() => {
+      const next = new Uint16Array(original);
+      for (let i = 0; i < next.length; i++) {
+        if (!isIndexInFilter(i)) continue;
+        const replacement = replacementById.get(next[i]);
+        if (replacement != null) {
+          next[i] = replacement;
+        }
+      }
+      return next;
+    });
+  }, [deleteMode, deleteSelectedIds, usedColorIds, paletteById, activeFilterRect, gridW]);
 
   async function buildTraceImageDataUrl() {
     if (!traceImage) return null;
@@ -1835,49 +2320,218 @@ export default function PatternEditor() {
         </span>
       </button>
       <div style={{ ...collapseStyle(usedColorsOpen, 800) }}>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 6 }}>
+          <div
+            className="used-colors-toolbar"
+            style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 6 }}
+          >
             <button
               onClick={toggleRemapMode}
               aria-pressed={remapMode}
+              aria-label="Replace colors"
+              data-tooltip="Replace colors"
+              data-active={remapMode ? "true" : undefined}
               style={{
-                padding: "4px 10px",
-                borderRadius: 999,
-                border: remapMode ? "1px solid var(--accent-strong)" : "none",
-                background: remapMode ? "var(--accent-soft)" : "var(--muted-bg)",
-                color: remapMode ? "var(--accent-strong)" : "var(--foreground)",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "6px 8px",
+                borderRadius: 10,
                 cursor: "pointer",
-                fontSize: 12,
-                fontWeight: 600,
               }}
             >
-              Swap colors
+              <img
+                src={assetPath("/swap.svg")}
+                alt=""
+                aria-hidden="true"
+                width={18}
+                height={18}
+                style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+              />
             </button>
             <button
-              onClick={toggleIdentifyMode}
-              aria-pressed={identifyMode}
+              onClick={toggleMergeMode}
+              aria-pressed={mergeMode}
+              aria-label="Merge colors"
+              data-tooltip="Merge colors"
+              data-active={mergeMode ? "true" : undefined}
               style={{
-                padding: "4px 10px",
-                borderRadius: 999,
-                border: identifyMode ? "1px solid var(--accent-strong)" : "none",
-                background: identifyMode ? "var(--accent-soft)" : "var(--muted-bg)",
-                color: identifyMode ? "var(--accent-strong)" : "var(--foreground)",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "6px 8px",
+                borderRadius: 10,
                 cursor: "pointer",
-                fontSize: 12,
-                fontWeight: 600,
               }}
             >
-              Identify
+              <img
+                src={assetPath("/merge.svg")}
+                alt=""
+                aria-hidden="true"
+                width={18}
+                height={18}
+                style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+              />
+            </button>
+            <button
+              onClick={toggleDeleteMode}
+              aria-pressed={deleteMode}
+              aria-label="Delete colors"
+              data-tooltip="Delete colors"
+              data-active={deleteMode ? "true" : undefined}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "6px 8px",
+                borderRadius: 10,
+                cursor: "pointer",
+              }}
+            >
+              <img
+                src={assetPath("/deselect.svg")}
+                alt=""
+                aria-hidden="true"
+                width={18}
+                height={18}
+                style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+              />
+            </button>
+            <button
+              onClick={() => {
+                if (filterMode) {
+                  clearFilterSelection();
+                } else {
+                  startFilterSelection();
+                }
+              }}
+              aria-pressed={filterMode}
+              aria-label="Filter canvas"
+              data-tooltip="Filter canvas"
+              data-active={filterMode ? "true" : undefined}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "6px 8px",
+                borderRadius: 10,
+                cursor: "pointer",
+              }}
+            >
+              <img
+                src={assetPath("/crop_filter.svg")}
+                alt=""
+                aria-hidden="true"
+                width={18}
+                height={18}
+                style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+              />
             </button>
             <div style={{ fontSize: 12, opacity: 0.7 }}>
               {remapMode
                 ? remapSourceId !== null
                   ? "Pick replacement color."
                   : "Select a used color to replace."
-                : identifyMode
-                  ? "Select a used color to highlight."
+                : mergeMode
+                  ? mergeSelectedIds.length < 2
+                    ? "Select at least 2 colors."
+                    : mergeTargetId
+                      ? "Ready to merge."
+                      : "Pick a target color."
+                : deleteMode
+                  ? deleteSelectedIds.length === 0
+                    ? "Select colors to delete."
+                    : usedColors.length - deleteSelectedIds.length < 1
+                      ? "Keep at least one color."
+                      : "Ready to delete."
                 : ""}
             </div>
           </div>
+          {filterSelecting && (
+            <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 6 }}>
+              Drag on canvas to set your filter area. Color changes will only apply within selection.
+            </div>
+          )}
+          {deleteMode && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+              <button
+                onClick={() => {
+                  cancelDelete();
+                  setDeleteMode(false);
+                }}
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "none",
+                  background: "var(--muted-bg)",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteColors}
+                disabled={deleteSelectedIds.length === 0 || usedColors.length - deleteSelectedIds.length < 1}
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "1px solid var(--foreground)",
+                  background: "var(--foreground)",
+                  color: "var(--background)",
+                  cursor:
+                    deleteSelectedIds.length === 0 || usedColors.length - deleteSelectedIds.length < 1
+                      ? "not-allowed"
+                      : "pointer",
+                  opacity: deleteSelectedIds.length === 0 || usedColors.length - deleteSelectedIds.length < 1 ? 0.5 : 1,
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          )}
+          {mergeMode && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+              <button
+                onClick={() => {
+                  cancelMerge();
+                  setMergeMode(false);
+                }}
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "none",
+                  background: "var(--muted-bg)",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmMerge}
+                disabled={mergeSelectedIds.length < 2 || mergeTargetId === null}
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 999,
+                  border: "1px solid var(--foreground)",
+                  background: "var(--foreground)",
+                  color: "var(--background)",
+                  cursor: mergeSelectedIds.length < 2 || mergeTargetId === null ? "not-allowed" : "pointer",
+                  opacity: mergeSelectedIds.length < 2 || mergeTargetId === null ? 0.5 : 1,
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                Merge
+              </button>
+            </div>
+          )}
           {remapMode && (
             <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
               <button
@@ -1923,39 +2577,122 @@ export default function PatternEditor() {
             ) : (
               usedColors.map(({ color, count }) => {
                 const isIdentifyActive = identifyColorId === color.id;
+                const isMergeSelected = mergeSelectedIds.includes(color.id);
+                const isMergeTarget = mergeTargetId === color.id;
+                const isDeleteSelected = deleteSelectedIds.includes(color.id);
+                const mergeSelectionIndex = mergeSelectedIds.indexOf(color.id);
+                const isRemapTarget = remapTargetId === color.id;
+                const borderStyle = mergeMode && isMergeTarget
+                  ? "2px solid var(--accent-strong)"
+                  : mergeMode && isMergeSelected
+                    ? "2px solid var(--accent)"
+                    : deleteMode && isDeleteSelected
+                      ? "2px solid var(--accent-strong)"
+                      : remapSourceId === color.id
+                        ? "2px solid var(--foreground)"
+                        : remapMode && isRemapTarget
+                          ? "2px solid var(--accent-strong)"
+                          : isIdentifyActive
+                            ? "2px solid var(--accent-strong)"
+                            : "1px solid transparent";
+                const backgroundStyle =
+                  mergeMode && isMergeSelected
+                    ? "var(--accent-wash)"
+                    : deleteMode && isDeleteSelected
+                      ? "var(--accent-wash)"
+                      : remapMode && isRemapTarget
+                        ? "var(--accent-wash)"
+                        : "transparent";
+                const handleUsedColorClick = () => {
+                  if (deleteMode) {
+                    setDeleteSelectedIds((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(color.id)) {
+                        next.delete(color.id);
+                      } else {
+                        next.add(color.id);
+                      }
+                      return Array.from(next);
+                    });
+                    return;
+                  }
+                  if (mergeMode) {
+                    setMergeSelectedIds((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(color.id)) {
+                        if (mergeTargetId === color.id) {
+                          setMergeTargetId(null);
+                        }
+                        next.delete(color.id);
+                      } else {
+                        next.add(color.id);
+                        setMergeTargetId(color.id);
+                      }
+                      return Array.from(next);
+                    });
+                    return;
+                  }
+                  if (remapMode) {
+                    if (remapSourceId === null) {
+                      beginRemap(color.id);
+                      return;
+                    }
+                    if (color.id === remapSourceId) return;
+                    previewRemap(color.id);
+                    return;
+                  }
+                  setActiveColorId(color.id);
+                };
                 return (
-                  <button
+                  <div
                     key={color.id}
-                    onClick={() => {
-                      if (remapMode) {
-                        beginRemap(color.id);
-                        return;
+                    role="button"
+                    tabIndex={0}
+                    onClick={handleUsedColorClick}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handleUsedColorClick();
                       }
-                      if (identifyMode) {
-                        setIdentifyColorId((prev) => (prev === color.id ? null : color.id));
-                        return;
-                      }
-                      setActiveColorId(color.id);
                     }}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       gap: 8,
                       padding: "4px 6px",
+                      position: "relative",
                       borderRadius: 8,
-                      border:
-                        remapSourceId === color.id
-                          ? "2px solid var(--foreground)"
-                          : isIdentifyActive
-                            ? "2px solid var(--accent-strong)"
-                            : "1px solid transparent",
-                      background: "transparent",
+                      border: borderStyle,
+                      background: backgroundStyle,
                       cursor: "pointer",
                       textAlign: "left",
                       minWidth: 0,
                     }}
                     aria-label={`Select ${color.name}`}
                   >
+                    {mergeMode && isMergeSelected && (
+                      <span
+                        style={{
+                          position: "absolute",
+                          top: -6,
+                          right: -6,
+                          minWidth: 18,
+                          height: 18,
+                          padding: "0 4px",
+                          borderRadius: 999,
+                          background: "var(--accent-strong)",
+                          color: "#ffffff",
+                          fontSize: 10,
+                          fontWeight: 700,
+                          display: "grid",
+                          placeItems: "center",
+                          boxShadow: "0 2px 6px rgba(0,0,0,0.2)",
+                          pointerEvents: "none",
+                        }}
+                      >
+                        {mergeSelectionIndex + 1}
+                      </span>
+                    )}
                     <span
                       style={{
                         width: 26,
@@ -1964,9 +2701,26 @@ export default function PatternEditor() {
                         background: color.hex,
                         display: "block",
                         flexShrink: 0,
-                        boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.15)",
+                        boxShadow: isMergeTarget
+                          ? "0 0 0 3px var(--accent-strong), 0 0 0 6px rgba(191,100,217,0.25), inset 0 0 0 1px rgba(0,0,0,0.2)"
+                          : "inset 0 0 0 1px rgba(0,0,0,0.15)",
                         position: "relative",
                       }}
+                      onClick={(event) => {
+                        if (!mergeMode) return;
+                        event.stopPropagation();
+                        setMergeSelectedIds((prev) => {
+                          const next = new Set(prev);
+                          if (!next.has(color.id)) {
+                            next.add(color.id);
+                          }
+                          return Array.from(next);
+                        });
+                        setMergeTargetId((prev) => (prev === color.id ? null : color.id));
+                      }}
+                      role={mergeMode ? "button" : undefined}
+                      aria-label={mergeMode ? `Set ${color.name} as merge target` : undefined}
+                      title={mergeMode ? "Set as merge target" : undefined}
                     >
                       {showSymbols && symbolForColorId(color.id, symbolMap) && (
                         <span
@@ -1975,7 +2729,8 @@ export default function PatternEditor() {
                             inset: 0,
                             display: "grid",
                             placeItems: "center",
-                            fontSize: 9,
+                            fontSize: 12,
+                            fontWeight: 700,
                             color: contrastForHex(color.hex),
                             opacity: 0.85,
                             pointerEvents: "none",
@@ -1998,7 +2753,36 @@ export default function PatternEditor() {
                       {color.code ? `#${color.code} ` : ""}
                       {color.name} ({count})
                     </span>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setIdentifyColorId((prev) => (prev === color.id ? null : color.id));
+                      }}
+                      aria-label={isIdentifyActive ? `Hide ${color.name}` : `Identify ${color.name}`}
+                      title={isIdentifyActive ? "Hide highlight" : "Highlight color"}
+                      style={{
+                        width: 24,
+                        height: 24,
+                        borderRadius: 999,
+                        border: isIdentifyActive ? "1px solid var(--accent-strong)" : "1px solid transparent",
+                        background: isIdentifyActive ? "var(--accent-soft)" : "transparent",
+                        display: "grid",
+                        placeItems: "center",
+                        cursor: "pointer",
+                        flexShrink: 0,
+                      }}
+                    >
+                      <img
+                        src={assetPath("/identify.svg")}
+                        alt=""
+                        aria-hidden="true"
+                        width={14}
+                        height={14}
+                        style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+                      />
+                    </button>
+                  </div>
                 );
               })
             )}
@@ -2680,8 +3464,15 @@ export default function PatternEditor() {
               onUndo={undo}
               onRedo={redo}
               onClear={clearGrid}
+              clearButtonRef={clearButtonRef}
               canUndo={history.length > 0}
               canRedo={future.length > 0}
+              lastEditCell={lastEditCell}
+              onJumpToLastEdit={() => {
+                if (!lastEditCell) return;
+                setJumpToLastEditTick((tick) => tick + 1);
+              }}
+              jumpToLastEditToken={jumpToLastEditTick}
               zoom={zoom}
               minZoom={minZoom}
               maxZoom={maxZoom}
@@ -2692,6 +3483,15 @@ export default function PatternEditor() {
               showSymbols={showSymbols}
               identifyColorId={identifyColorId}
               symbolMap={symbolMap}
+              filterMode={filterMode}
+              filterRect={activeFilterRect}
+              filterSelecting={filterSelecting}
+              onStartFilterSelection={startFilterSelection}
+              onClearFilterSelection={clearFilterSelection}
+              onFilterRectChange={(rect: FilterRect | null) =>
+                setFilterRect(rect ? clampFilterRect(rect, gridW, gridH) : null)
+              }
+              onFilterSelectEnd={() => setFilterSelecting(false)}
             />
           </div>
         </div>
@@ -2761,6 +3561,80 @@ export default function PatternEditor() {
           </div>
         )}
       </div>
+      {confirmDialog && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={confirmDialog.title}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(15, 23, 42, 0.35)",
+            display: "block",
+            zIndex: 50,
+            padding: 16,
+          }}
+          onClick={() => setConfirmDialog(null)}
+        >
+          <div
+            style={{
+              background: "var(--card-bg)",
+              color: "var(--foreground)",
+              borderRadius: 14,
+              padding: 16,
+              width: "min(360px, 90vw)",
+              boxShadow: "0 16px 40px rgba(15, 23, 42, 0.2)",
+              display: "grid",
+              gap: 12,
+              position: "absolute",
+              top: confirmDialog.position ? confirmDialog.position.top : "50%",
+              left: confirmDialog.position ? confirmDialog.position.left : "50%",
+              transform: confirmDialog.position ? "none" : "translate(-50%, -50%)",
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div style={{ fontWeight: 700, fontSize: 15 }}>{confirmDialog.title}</div>
+            <div style={{ fontSize: 12.5, opacity: 0.75 }}>{confirmDialog.message}</div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "none",
+                  background: "var(--muted-bg)",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDialog(null);
+                  confirmActionRef.current?.();
+                }}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "1px solid var(--accent-strong)",
+                  background: "var(--accent-wash)",
+                  color: "var(--accent-strong)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 700,
+                }}
+              >
+                {confirmDialog.confirmLabel ?? "OK"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2814,8 +3688,12 @@ function CanvasWithExportRef(props: any) {
     onUndo,
     onRedo,
     onClear,
+    clearButtonRef,
     canUndo,
     canRedo,
+    lastEditCell,
+    onJumpToLastEdit,
+    jumpToLastEditToken,
     zoom,
     minZoom,
     maxZoom,
@@ -2825,6 +3703,13 @@ function CanvasWithExportRef(props: any) {
     onControlsHeightChange,
     showSymbols,
     identifyColorId,
+    filterMode,
+    filterRect,
+    filterSelecting,
+    onStartFilterSelection,
+    onClearFilterSelection,
+    onFilterRectChange,
+    onFilterSelectEnd,
   } = props;
 
   // Render the interactive canvas
@@ -2832,15 +3717,42 @@ function CanvasWithExportRef(props: any) {
   const exportCellSize = EXPORT_CELL_SIZE;
   const zoomPercent = Math.round(zoom * 100);
   const [zoomInput, setZoomInput] = useState(String(zoomPercent));
+  const zoomStep =
+    zoom < 1 ? 0.1 : zoom < 2 ? 0.2 : zoom < 4 ? 0.35 : 0.5;
   const activeColor = paletteById.get(activeColorId);
+  const hasFilterRect = Boolean(filterRect);
   const canvasCardRef = useRef<HTMLDivElement | null>(null);
   const zoomRowRef = useRef<HTMLDivElement | null>(null);
-  const [alignTop, setAlignTop] = useState(false);
-  const [panToTopTick, setPanToTopTick] = useState(0);
+  const [canvasCardMaxHeight, setCanvasCardMaxHeight] = useState<number | null>(null);
+  const [canvasViewportHeight, setCanvasViewportHeight] = useState<number | null>(null);
+  const [centerCanvasTick, setCenterCanvasTick] = useState(0);
 
   useEffect(() => {
     setZoomInput(String(zoomPercent));
   }, [zoomPercent]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const updateHeights = () => {
+      const card = canvasCardRef.current;
+      if (!card) return;
+      const rect = card.getBoundingClientRect();
+      const bottomPadding = 16;
+      const maxHeight = Math.max(240, Math.floor(window.innerHeight - rect.top - bottomPadding));
+      setCanvasCardMaxHeight(maxHeight);
+      const zoomRowHeight = zoomRowRef.current?.getBoundingClientRect().height ?? 0;
+      const padding = 12;
+      const gap = 10;
+      const availableCanvasHeight = Math.max(120, maxHeight - zoomRowHeight - padding * 2 - gap);
+      setCanvasViewportHeight(availableCanvasHeight);
+    };
+    updateHeights();
+    window.addEventListener("resize", updateHeights);
+    return () => window.removeEventListener("resize", updateHeights);
+  }, [containerWidth, containerHeight, zoom]);
+
+  const effectiveContainerHeight =
+    canvasViewportHeight !== null ? Math.min(containerHeight, canvasViewportHeight) : containerHeight;
 
   function commitZoomInput(value: string) {
     if (value.trim() === "") {
@@ -2872,8 +3784,7 @@ function CanvasWithExportRef(props: any) {
     if (!Number.isFinite(baseCellSize) || baseCellSize <= 0) return;
     const nextZoom = available / (height * baseCellSize);
     onZoomChange(nextZoom);
-    setAlignTop(true);
-    setPanToTopTick((tick) => tick + 1);
+    setCenterCanvasTick((tick) => tick + 1);
   }
 
   const controlsRef = useRef<HTMLDivElement | null>(null);
@@ -2913,12 +3824,11 @@ function CanvasWithExportRef(props: any) {
               onClick={onTogglePanMode}
               aria-pressed={panMode}
               aria-label="Pan"
+              data-tooltip="Pan"
+              data-active={panMode ? "true" : undefined}
               style={{
-                padding: "8px 10px",
+                padding: "6px 8px",
                 borderRadius: 10,
-                border: "none",
-                background: panMode ? "var(--foreground)" : "transparent",
-                color: panMode ? "var(--background)" : "var(--foreground)",
                 cursor: "pointer",
               }}
             >
@@ -2928,7 +3838,7 @@ function CanvasWithExportRef(props: any) {
               aria-hidden="true"
               width={18}
                 height={18}
-                style={{ display: "block", filter: panMode ? "var(--icon-on-fg-filter)" : "var(--icon-on-bg-filter)" }}
+                style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
               />
             </button>
           {(["paint", "eraser", "fill", "eyedropper", "lasso"] as const).map((t) => (
@@ -2946,12 +3856,21 @@ function CanvasWithExportRef(props: any) {
                       ? "Eyedropper"
                       : "Lasso"
               }
+              data-tooltip={
+                t === "paint"
+                  ? "Brush"
+                  : t === "eraser"
+                    ? "Eraser"
+                    : t === "fill"
+                      ? "Fill"
+                      : t === "eyedropper"
+                        ? "Eyedropper"
+                        : "Lasso"
+              }
+              data-active={tool === t && !panMode ? "true" : undefined}
               style={{
-                padding: "8px 10px",
+                padding: "6px 8px",
                 borderRadius: 10,
-                  border: "none",
-                  background: tool === t && !panMode ? "var(--foreground)" : "transparent",
-                  color: tool === t && !panMode ? "var(--background)" : "var(--foreground)",
                   cursor: "pointer",
                 }}
             >
@@ -2973,7 +3892,7 @@ function CanvasWithExportRef(props: any) {
                 height={18}
                 style={{
                   display: "block",
-                  filter: tool === t && !panMode ? "var(--icon-on-fg-filter)" : "var(--icon-on-bg-filter)",
+                  filter: "var(--icon-on-bg-filter)",
                 }}
               />
             </button>
@@ -2983,12 +3902,10 @@ function CanvasWithExportRef(props: any) {
               onClick={onUndo}
               disabled={!canUndo}
               aria-label="Undo"
+              data-tooltip="Undo"
               style={{
-                padding: "8px 10px",
+                padding: "6px 8px",
                 borderRadius: 10,
-                border: "none",
-                background: "transparent",
-                color: "var(--foreground)",
                 cursor: "pointer",
                 opacity: canUndo ? 1 : 0.5,
               }}
@@ -3006,12 +3923,10 @@ function CanvasWithExportRef(props: any) {
               onClick={onRedo}
               disabled={!canRedo}
               aria-label="Redo"
+              data-tooltip="Redo"
               style={{
-                padding: "8px 10px",
+                padding: "6px 8px",
                 borderRadius: 10,
-                border: "none",
-                background: "transparent",
-                color: "var(--foreground)",
                 cursor: "pointer",
                 opacity: canRedo ? 1 : 0.5,
               }}
@@ -3028,12 +3943,11 @@ function CanvasWithExportRef(props: any) {
             <button
               onClick={onClear}
               aria-label="Clear"
+              data-tooltip="Clear"
+              ref={clearButtonRef}
               style={{
-                padding: "8px 10px",
+                padding: "6px 8px",
                 borderRadius: 10,
-                border: "none",
-                background: "transparent",
-                color: "var(--foreground)",
                 cursor: "pointer",
               }}
             >
@@ -3091,13 +4005,15 @@ function CanvasWithExportRef(props: any) {
           boxShadow: "0 6px 16px rgba(15, 23, 42, 0.12)",
           display: "grid",
           gap: 10,
+          maxHeight: canvasCardMaxHeight ?? undefined,
+          overflow: "visible",
         }}
       >
         <div
           ref={zoomRowRef}
           style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ display: "grid", justifyItems: "center", gap: 4 }}>
             <span
               style={{
                 width: 24,
@@ -3108,7 +4024,7 @@ function CanvasWithExportRef(props: any) {
                 display: "inline-block",
               }}
             />
-            <span style={{ fontSize: 14, opacity: 0.7, fontWeight: 600 }}>
+            <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>
               {activeColor?.code ? `#${activeColor.code}` : ""}
             </span>
           </div>
@@ -3118,24 +4034,39 @@ function CanvasWithExportRef(props: any) {
           >
             <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
               <button
-                onClick={() => {
-                  setAlignTop(false);
-                  onZoomChange(1);
-                }}
+                onClick={() => onJumpToLastEdit?.()}
+                disabled={!lastEditCell}
+                aria-label="Jump to last edit"
+                data-tooltip="Jump to last edit"
+                title="Jump to last edit"
                 style={{
                   padding: "4px 8px",
                   borderRadius: 8,
                   border: "none",
                   background: "var(--muted-bg)",
                   color: "var(--foreground)",
-                  cursor: "pointer",
+                  cursor: lastEditCell ? "pointer" : "not-allowed",
+                  opacity: lastEditCell ? 1 : 0.5,
                   fontSize: 12,
                 }}
               >
-                Fit width
+                <img
+                  src={assetPath("/jump_to_element.svg")}
+                  alt=""
+                  aria-hidden="true"
+                  width={16}
+                  height={16}
+                  style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+                />
               </button>
               <button
-                onClick={fitToHeight}
+                onClick={() => {
+                  onZoomChange(1);
+                  setCenterCanvasTick((tick) => tick + 1);
+                }}
+                aria-label="Fit width"
+                data-tooltip="Fit width"
+                title="Fit width"
                 style={{
                   padding: "4px 8px",
                   borderRadius: 8,
@@ -3146,7 +4077,40 @@ function CanvasWithExportRef(props: any) {
                   fontSize: 12,
                 }}
               >
-                Fit height
+                <img
+                  src={assetPath("/fit_width.svg")}
+                  alt=""
+                  aria-hidden="true"
+                  width={16}
+                  height={16}
+                  style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+                />
+              </button>
+              <button
+                onClick={() => {
+                  fitToHeight();
+                }}
+                aria-label="Fit height"
+                data-tooltip="Fit height"
+                title="Fit height"
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "var(--muted-bg)",
+                  color: "var(--foreground)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+              >
+                <img
+                  src={assetPath("/fit_height.svg")}
+                  alt=""
+                  aria-hidden="true"
+                  width={16}
+                  height={16}
+                  style={{ display: "block", filter: "var(--icon-on-bg-filter)" }}
+                />
               </button>
               <input
                 type="text"
@@ -3177,7 +4141,7 @@ function CanvasWithExportRef(props: any) {
             </div>
             <div style={{ display: "flex", gap: 4, alignItems: "center", width: "100%" }}>
               <button
-                onClick={() => onZoomChange(Math.max(minZoom, Number((zoom - 0.1).toFixed(2))))}
+                onClick={() => onZoomChange(Math.max(minZoom, Number((zoom - zoomStep).toFixed(2))))}
                 style={{
                   padding: "4px 8px",
                   borderRadius: 8,
@@ -3198,7 +4162,7 @@ function CanvasWithExportRef(props: any) {
                 style={{ flex: 1 }}
               />
               <button
-                onClick={() => onZoomChange(Math.min(maxZoom, Number((zoom + 0.1).toFixed(2))))}
+                onClick={() => onZoomChange(Math.min(maxZoom, Number((zoom + zoomStep).toFixed(2))))}
                 style={{
                   padding: "4px 8px",
                   borderRadius: 8,
@@ -3223,9 +4187,7 @@ function CanvasWithExportRef(props: any) {
           identifyColorId={identifyColorId}
           cellSize={cellSize}
           containerWidth={containerWidth}
-          containerHeight={containerHeight}
-          alignTop={alignTop}
-          panToTopToken={panToTopTick}
+          containerHeight={effectiveContainerHeight}
           showGridlines={showGridlines}
           tool={tool}
           brushSize={brushSize}
@@ -3259,6 +4221,13 @@ function CanvasWithExportRef(props: any) {
           maxZoom={maxZoom}
           pinchEnabled={pinchEnabled}
           onZoomChange={onZoomChange}
+          centerCanvasToken={centerCanvasTick}
+          focusCell={lastEditCell}
+          focusCellToken={jumpToLastEditToken}
+          filterRect={filterRect}
+          filterSelecting={filterSelecting}
+          onFilterRectChange={onFilterRectChange}
+          onFilterSelectEnd={onFilterSelectEnd}
         />
       </div>
 
@@ -3328,7 +4297,7 @@ function ExportCanvas({
           ctx.fillStyle = contrastForHex(color.hex);
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
-          ctx.font = `${Math.max(8, Math.floor(cellSize * 0.6))}px ui-sans-serif, system-ui, sans-serif`;
+          ctx.font = `700 ${Math.max(10, Math.floor(cellSize * 0.7))}px ui-sans-serif, system-ui, sans-serif`;
           ctx.fillText(symbol, x * cellSize + cellSize / 2, y * cellSize + cellSize / 2 + 0.5);
           ctx.restore();
         }

@@ -255,11 +255,66 @@ button:disabled {
 .app-card:hover {
   z-index: 2;
 }
-.canvas-toolbar button {
+.canvas-toolbar button,
+.used-colors-toolbar button,
+.zoom-row button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--foreground);
   box-shadow: none;
   outline: none;
+  position: relative;
 }
-.canvas-toolbar button:focus-visible {
+.canvas-toolbar button[data-tooltip]::after,
+.used-colors-toolbar button[data-tooltip]::after,
+.zoom-row button[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 10px);
+  transform: translateX(-50%);
+  background: var(--accent-strong);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.22);
+  transition: opacity 140ms ease;
+  z-index: 10;
+}
+.canvas-toolbar button[data-tooltip]:hover::after,
+.canvas-toolbar button[data-tooltip]:focus-visible::after,
+.used-colors-toolbar button[data-tooltip]:hover::after,
+.used-colors-toolbar button[data-tooltip]:focus-visible::after,
+.zoom-row button[data-tooltip]:hover::after,
+.zoom-row button[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+}
+.canvas-toolbar button:hover:not(:disabled):not([data-active="true"]),
+.used-colors-toolbar button:hover:not(:disabled):not([data-active="true"]) {
+  background: var(--accent-wash);
+  border-color: var(--accent-soft);
+  filter: none;
+}
+.canvas-toolbar button[data-active="true"],
+.used-colors-toolbar button[data-active="true"] {
+  background: var(--accent-wash);
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+  filter: none;
+}
+.canvas-toolbar button[data-active="true"]:hover:not(:disabled),
+.used-colors-toolbar button[data-active="true"]:hover:not(:disabled) {
+  background: var(--accent-wash);
+}
+.canvas-toolbar button:focus-visible,
+.used-colors-toolbar button:focus-visible {
   outline: 2px solid var(--accent-strong);
   outline-offset: 2px;
 }

@@ -120,7 +120,7 @@ function renderSymbolCanvas(opts: {
       ctx.fillStyle = "#000000";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.font = `${Math.max(8, Math.floor(cellSize * 0.6))}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.font = `700 ${Math.max(10, Math.floor(cellSize * 0.7))}px ui-sans-serif, system-ui, sans-serif`;
       ctx.fillText(symbol, x * cellSize + cellSize / 2, y * cellSize + cellSize / 2 + 0.5);
       ctx.restore();
     }
